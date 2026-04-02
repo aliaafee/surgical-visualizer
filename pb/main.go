@@ -2,14 +2,15 @@ package main
 
 import (
 	"log"
+	"net/http"
 	"os"
 
+	"github.com/labstack/echo/v5"
 	"github.com/pocketbase/pocketbase"
-	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/plugins/migratecmd"
 
-	"surgical-visualizer/hooks"
+	"surgical-visualizer-server/hooks"
 )
 
 func main() {
@@ -25,19 +26,28 @@ func main() {
 	hooks.RegisterTestHooks(app)
 
 	// Serve static files from pb_public directory
-	app.OnServe().BindFunc(func(se *core.ServeEvent) error {
-		// Serves static files from the provided public dir (if exists)
-		se.Router.GET("/{path...}", apis.Static(os.DirFS("./pb_public"), false))
-
-		return se.Next()
+	app.OnBeforeServe().Add(func(e *core.ServeEvent) error {
+		// Serve static files from pb_public directory
+		e.Router.GET("/*", echo.StaticDirectoryHandler(os.DirFS("./pb_public"), false))
+		return nil
 	})
 
 	// Log startup message
-	app.OnServe().BindFunc(func(se *core.ServeEvent) error {
+	app.OnBeforeServe().Add(func(e *core.ServeEvent) error {
 		log.Println("🏥 Surgical Visualizer Backend Started")
-		log.Printf("📍 Admin UI: %s/_/", se.App.Settings().Meta.AppURL)
-		log.Printf("📍 API: %s/api/", se.App.Settings().Meta.AppURL)
-		return se.Next()
+		log.Printf("📍 Admin UI: http://127.0.0.1:8090/_/")
+		log.Printf("📍 API: http://127.0.0.1:8090/api/")
+		return nil
+	})
+
+	// Custom route example
+	app.OnBeforeServe().Add(func(e *core.ServeEvent) error {
+		e.Router.GET("/api/hello", func(c echo.Context) error {
+			return c.JSON(http.StatusOK, map[string]string{
+				"message": "Hello from Surgical Visualizer!",
+			})
+		})
+		return nil
 	})
 
 	if err := app.Start(); err != nil {
