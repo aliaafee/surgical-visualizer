@@ -2,7 +2,6 @@ package main
 
 import (
 	"log"
-	"net/http"
 	"os"
 
 	"github.com/labstack/echo/v5"
@@ -11,6 +10,7 @@ import (
 	"github.com/pocketbase/pocketbase/plugins/migratecmd"
 
 	"surgical-visualizer-server/hooks"
+	"surgical-visualizer-server/routes"
 )
 
 func main() {
@@ -25,6 +25,11 @@ func main() {
 	// Register test hooks
 	hooks.RegisterTestHooks(app)
 
+	// Register visualizer routes
+	app.OnBeforeServe().Add(func(e *core.ServeEvent) error {
+		return routes.RegisterVisualizerRoutes(e)
+	})
+
 	// Serve static files from pb_public directory
 	app.OnBeforeServe().Add(func(e *core.ServeEvent) error {
 		// Serve static files from pb_public directory
@@ -37,16 +42,7 @@ func main() {
 		log.Println("🏥 Surgical Visualizer Backend Started")
 		log.Printf("📍 Admin UI: http://127.0.0.1:8090/_/")
 		log.Printf("📍 API: http://127.0.0.1:8090/api/")
-		return nil
-	})
-
-	// Custom route example
-	app.OnBeforeServe().Add(func(e *core.ServeEvent) error {
-		e.Router.GET("/api/hello", func(c echo.Context) error {
-			return c.JSON(http.StatusOK, map[string]string{
-				"message": "Hello from Surgical Visualizer!",
-			})
-		})
+		log.Printf("🔧 Visualizer Routes: http://127.0.0.1:8090/api/visualizer/")
 		return nil
 	})
 
