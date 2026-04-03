@@ -12,9 +12,9 @@ A web-based application for real-time 3D volume rendering of DICOM medical image
 
 - **Framework**: React 18+ with TypeScript
 - **3D Rendering**:
-  - Three.js (WebGL abstraction)
-  - VTK.js (Visualization Toolkit for medical imaging)
-  - Cornerstone3D (DICOM-specific rendering)
+    - Three.js (WebGL abstraction)
+    - VTK.js (Visualization Toolkit for medical imaging)
+    - Cornerstone3D (DICOM-specific rendering)
 - **Styling**: Tailwind CSS
 - **UI Components**: Headless UI or Radix UI (with Tailwind)
 - **State Management**: Zustand
@@ -24,8 +24,8 @@ A web-based application for real-time 3D volume rendering of DICOM medical image
 
 - **Runtime**: PocketBase (Go-based backend)
 - **DICOM Processing**:
-  - go-dicom (Go DICOM library)
-  - Custom PocketBase hooks for DICOM parsing
+    - go-dicom (Go DICOM library)
+    - Custom PocketBase hooks for DICOM parsing
 - **Database**: SQLite
 - **File Storage**: Built-in PocketBase local storage
 - **API**: Auto-generated REST + Real-time subscriptions
@@ -65,10 +65,10 @@ A web-based application for real-time 3D volume rendering of DICOM medical image
 - [ ] Ray casting volume rendering
 - [ ] Transfer function editor (opacity/color mapping)
 - [ ] Preset rendering modes:
-  - CT Bone
-  - CT Soft Tissue
-  - MRI Brain
-  - CT Angiography
+    - CT Bone
+    - CT Soft Tissue
+    - MRI Brain
+    - CT Angiography
 - [ ] Isosurface extraction
 - [ ] Maximum Intensity Projection (MIP)
 
@@ -213,7 +213,8 @@ backend/
 
 **Note:**
 
-- `pb_data/` and `pb_migrations/` are auto-generated and should be in `.gitignore`
+- `pb_data/` is auto-generated and should be in `.gitignore`
+- JS migrations in `pb_migrations/` should be committed to version control
 - Go migrations in `migrations/` should be committed to version control
 - Hooks are registered in `main.go` using event listeners
 - PocketBase will automatically create `pb_data` directory on first run
@@ -538,28 +539,28 @@ backend/
 
 ```json
 {
-  "frontend": {
-    "@cornerstonejs/core": "^1.x",
-    "@cornerstonejs/tools": "^1.x",
-    "@vtk-js/vtk.js": "^27.x",
-    "three": "^0.160.x",
-    "react": "^18.x",
-    "typescript": "^5.x",
-    "vite": "^5.x",
-    "@tanstack/react-query": "^5.x",
-    "zustand": "^4.x",
-    "tailwindcss": "^3.x",
-    "autoprefixer": "^10.x",
-    "postcss": "^8.x",
-    "@headlessui/react": "^1.x",
-    "clsx": "^2.x",
-    "tailwind-merge": "^2.x"
-  },
-  "backend": {
-    "pocketbase": "^0.22.x",
-    "go-dicom": "github.com/suyashkumar/dicom",
-    "orthanc": "docker image (optional)"
-  }
+    "frontend": {
+        "@cornerstonejs/core": "^1.x",
+        "@cornerstonejs/tools": "^1.x",
+        "@vtk-js/vtk.js": "^27.x",
+        "three": "^0.160.x",
+        "react": "^18.x",
+        "typescript": "^5.x",
+        "vite": "^5.x",
+        "@tanstack/react-query": "^5.x",
+        "zustand": "^4.x",
+        "tailwindcss": "^3.x",
+        "autoprefixer": "^10.x",
+        "postcss": "^8.x",
+        "@headlessui/react": "^1.x",
+        "clsx": "^2.x",
+        "tailwind-merge": "^2.x"
+    },
+    "backend": {
+        "pocketbase": "^0.22.x",
+        "go-dicom": "github.com/suyashkumar/dicom",
+        "orthanc": "docker image (optional)"
+    }
 }
 ```
 
@@ -760,31 +761,31 @@ backend/
 
 1. **Set up development environment**
 
-   ```bash
-   # Initialize project structure
-   mkdir -p frontend backend orthanc
-   ```
+    ```bash
+    # Initialize project structure
+    mkdir -p frontend backend orthanc
+    ```
 
 2. **Proof of Concept (Week 1)**
-   - Create simple DICOM file uploader
-   - Display basic 2D slice viewer
-   - Validate technical feasibility
+    - Create simple DICOM file uploader
+    - Display basic 2D slice viewer
+    - Validate technical feasibility
 
 3. **Technology Validation**
-   - Test Cornerstone3D with sample DICOM files
-   - Benchmark VTK.js performance
-   - Evaluate rendering quality vs. performance
+    - Test Cornerstone3D with sample DICOM files
+    - Benchmark VTK.js performance
+    - Evaluate rendering quality vs. performance
 
 4. **Team Assembly**
-   - Hire/assign developers
-   - Establish communication channels
-   - Set up project management tools
+    - Hire/assign developers
+    - Establish communication channels
+    - Set up project management tools
 
 5. **Infrastructure Setup**
-   - Download and configure PocketBase
-   - Set up version control
-   - Configure CI/CD pipeline
-   - (Optional) Deploy Orthanc DICOM server for advanced PACS features
+    - Download and configure PocketBase
+    - Set up version control
+    - Configure CI/CD pipeline
+    - (Optional) Deploy Orthanc DICOM server for advanced PACS features
 
 ---
 
