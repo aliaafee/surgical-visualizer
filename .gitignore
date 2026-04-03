@@ -12,11 +12,6 @@ dist
 dist-ssr
 releases
 *.local
-pb/pb_data
-pb/pocketbase.exe
-pb/pocketbase
-pb/surgical-visualizer-server.exe
-pb/surgical-visualizer-server
 
 # Editor directories and files
 .vscode/*
