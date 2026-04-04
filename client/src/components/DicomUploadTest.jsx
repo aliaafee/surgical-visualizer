@@ -9,6 +9,7 @@ export default function DicomUploadTest() {
     const [authError, setAuthError] = useState("");
 
     const [uploading, setUploading] = useState(false);
+    const [uploadProgress, setUploadProgress] = useState("");
     const [uploadResult, setUploadResult] = useState(null);
     const [uploadError, setUploadError] = useState("");
 
@@ -37,33 +38,74 @@ export default function DicomUploadTest() {
         }
     }
 
+    const CHUNK_SIZE = 10;
+
     async function upload(e) {
         e.preventDefault();
-        const files = fileInputRef.current?.files;
-        if (!files || files.length === 0) return;
+        const files = Array.from(fileInputRef.current?.files ?? []);
+        if (files.length === 0) return;
 
         setUploading(true);
         setUploadResult(null);
         setUploadError("");
+        setUploadProgress("");
 
-        const form = new FormData();
-        for (const file of files) {
-            form.append("files", file);
-        }
+        const merged = {
+            studyId: "",
+            studyInstanceUID: "",
+            series: [],
+            instances: [],
+            filesProcessed: 0,
+            errors: [],
+        };
+        const seenSeriesIds = new Set();
 
         try {
-            const res = await fetch(`${API_BASE}/api/visualizer/dicom/upload`, {
-                method: "POST",
-                headers: { Authorization: token },
-                body: form,
-            });
-            const data = await res.json();
-            if (!res.ok) throw new Error(data.error || "Upload failed");
-            setUploadResult(data);
+            const chunks = [];
+            for (let i = 0; i < files.length; i += CHUNK_SIZE) {
+                chunks.push(files.slice(i, i + CHUNK_SIZE));
+            }
+
+            for (let i = 0; i < chunks.length; i++) {
+                setUploadProgress(
+                    `Uploading chunk ${i + 1} of ${chunks.length}…`,
+                );
+                const form = new FormData();
+                for (const file of chunks[i]) {
+                    form.append("files", file);
+                }
+                const res = await fetch(
+                    `${API_BASE}/api/visualizer/dicom/upload`,
+                    {
+                        method: "POST",
+                        headers: { Authorization: token },
+                        body: form,
+                    },
+                );
+                const data = await res.json();
+                if (!res.ok)
+                    throw new Error(data.error || `Chunk ${i + 1} failed`);
+
+                if (data.studyId) merged.studyId = data.studyId;
+                if (data.studyInstanceUID)
+                    merged.studyInstanceUID = data.studyInstanceUID;
+                for (const s of data.series ?? []) {
+                    if (!seenSeriesIds.has(s.id)) {
+                        seenSeriesIds.add(s.id);
+                        merged.series.push(s);
+                    }
+                }
+                merged.instances.push(...(data.instances ?? []));
+                merged.filesProcessed += data.filesProcessed ?? 0;
+                merged.errors.push(...(data.errors ?? []));
+            }
+
+            setUploadResult(merged);
         } catch (err) {
             setUploadError(err.message);
         } finally {
             setUploading(false);
+            setUploadProgress("");
         }
     }
 
@@ -165,6 +207,9 @@ export default function DicomUploadTest() {
                         {uploading ? "Uploading…" : "Upload"}
                     </button>
                 </form>
+                {uploadProgress && (
+                    <p style={{ color: "#cba6f7" }}>{uploadProgress}</p>
+                )}
                 {uploadError && <p style={{ color: "red" }}>{uploadError}</p>}
                 {uploadResult && (
                     <div style={resultBoxStyle}>
