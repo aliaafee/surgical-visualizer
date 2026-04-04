@@ -30,6 +30,11 @@ func main() {
 		return routes.RegisterVisualizerRoutes(e)
 	})
 
+	// Register DICOM routes
+	app.OnBeforeServe().Add(func(e *core.ServeEvent) error {
+		return routes.RegisterDicomRoutes(app, e)
+	})
+
 	// Serve static files from pb_public directory
 	app.OnBeforeServe().Add(func(e *core.ServeEvent) error {
 		// Serve static files from pb_public directory
