@@ -181,11 +181,9 @@ func handleUpload(app *pocketbase.PocketBase) echo.HandlerFunc {
 
 func handleListStudies(app *pocketbase.PocketBase) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		authRecord := apis.RequestInfo(c).AuthRecord
-
 		records, err := app.Dao().FindRecordsByFilter(
-			"studies", "owner = {:owner}", "-created", 0, 0,
-			dbx.Params{"owner": authRecord.Id},
+			"studies", "1=1", "-created", 0, 0,
+			dbx.Params{},
 		)
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to fetch studies"})
@@ -214,11 +212,10 @@ func handleListStudies(app *pocketbase.PocketBase) echo.HandlerFunc {
 
 func handleGetStudy(app *pocketbase.PocketBase) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		authRecord := apis.RequestInfo(c).AuthRecord
 		studyId := c.PathParam("studyId")
 
 		study, err := app.Dao().FindRecordById("studies", studyId)
-		if err != nil || !canAccessStudy(study, authRecord.Id) {
+		if err != nil {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "study not found"})
 		}
 
@@ -268,16 +265,10 @@ func handleGetStudy(app *pocketbase.PocketBase) echo.HandlerFunc {
 
 func handleGetSeries(app *pocketbase.PocketBase) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		authRecord := apis.RequestInfo(c).AuthRecord
 		seriesId := c.PathParam("seriesId")
 
 		series, err := app.Dao().FindRecordById("series", seriesId)
 		if err != nil {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": "series not found"})
-		}
-
-		study, err := app.Dao().FindRecordById("studies", series.GetString("study"))
-		if err != nil || !canAccessStudy(study, authRecord.Id) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "series not found"})
 		}
 
@@ -321,15 +312,10 @@ func handleGetSeries(app *pocketbase.PocketBase) echo.HandlerFunc {
 
 func handleGetInstanceMetadata(app *pocketbase.PocketBase) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		authRecord := apis.RequestInfo(c).AuthRecord
 		instanceId := c.PathParam("instanceId")
 
-		inst, series, err := resolveInstance(app, instanceId)
+		inst, _, err := resolveInstance(app, instanceId)
 		if err != nil {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": "instance not found"})
-		}
-		study, err := app.Dao().FindRecordById("studies", series.GetString("study"))
-		if err != nil || !canAccessStudy(study, authRecord.Id) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "instance not found"})
 		}
 
@@ -353,15 +339,10 @@ func handleGetInstanceMetadata(app *pocketbase.PocketBase) echo.HandlerFunc {
 // handleGetInstanceFile redirects to PocketBase's built-in authenticated file endpoint.
 func handleGetInstanceFile(app *pocketbase.PocketBase) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		authRecord := apis.RequestInfo(c).AuthRecord
 		instanceId := c.PathParam("instanceId")
 
-		inst, series, err := resolveInstance(app, instanceId)
+		inst, _, err := resolveInstance(app, instanceId)
 		if err != nil {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": "instance not found"})
-		}
-		study, err := app.Dao().FindRecordById("studies", series.GetString("study"))
-		if err != nil || !canAccessStudy(study, authRecord.Id) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "instance not found"})
 		}
 
@@ -474,11 +455,6 @@ func resolveInstance(app *pocketbase.PocketBase, instanceId string) (*models.Rec
 		return nil, nil, err
 	}
 	return inst, series, nil
-}
-
-// canAccessStudy returns true if userID is the study owner.
-func canAccessStudy(study *models.Record, userID string) bool {
-	return study != nil && study.GetString("owner") == userID
 }
 
 // sanitizeFilename replaces characters unsafe in filenames.
