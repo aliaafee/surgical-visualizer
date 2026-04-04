@@ -1,9 +1,10 @@
 import { useState, useRef } from "react";
+import PocketBase from "pocketbase";
 
-const API_BASE = "http://127.0.0.1:8090";
+const pb = new PocketBase("http://127.0.0.1:8090");
 
 export default function DicomUploadTest() {
-    const [token, setToken] = useState("");
+    const [loggedIn, setLoggedIn] = useState(pb.authStore.isValid);
     const [email, setEmail] = useState("");
     const [password, setPassword] = useState("");
     const [authError, setAuthError] = useState("");
@@ -22,20 +23,16 @@ export default function DicomUploadTest() {
         e.preventDefault();
         setAuthError("");
         try {
-            const res = await fetch(
-                `${API_BASE}/api/collections/users/auth-with-password`,
-                {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ identity: email, password }),
-                },
-            );
-            const data = await res.json();
-            if (!res.ok) throw new Error(data.message || "Login failed");
-            setToken(data.token);
+            await pb.collection("users").authWithPassword(email, password);
+            setLoggedIn(true);
         } catch (err) {
             setAuthError(err.message);
         }
+    }
+
+    function logout() {
+        pb.authStore.clear();
+        setLoggedIn(false);
     }
 
     const CHUNK_SIZE = 10;
@@ -74,17 +71,10 @@ export default function DicomUploadTest() {
                 for (const file of chunks[i]) {
                     form.append("files", file);
                 }
-                const res = await fetch(
-                    `${API_BASE}/api/visualizer/dicom/upload`,
-                    {
-                        method: "POST",
-                        headers: { Authorization: token },
-                        body: form,
-                    },
-                );
-                const data = await res.json();
-                if (!res.ok)
-                    throw new Error(data.error || `Chunk ${i + 1} failed`);
+                const data = await pb.send("/api/visualizer/dicom/upload", {
+                    method: "POST",
+                    body: form,
+                });
 
                 if (data.studyId) merged.studyId = data.studyId;
                 if (data.studyInstanceUID)
@@ -113,15 +103,7 @@ export default function DicomUploadTest() {
         setStudiesError("");
         setStudies(null);
         try {
-            const res = await fetch(
-                `${API_BASE}/api/visualizer/dicom/studies`,
-                {
-                    headers: { Authorization: token },
-                },
-            );
-            const data = await res.json();
-            if (!res.ok)
-                throw new Error(data.error || "Failed to fetch studies");
+            const data = await pb.send("/api/visualizer/dicom/studies", {});
             setStudies(data);
         } catch (err) {
             setStudiesError(err.message);
@@ -142,10 +124,10 @@ export default function DicomUploadTest() {
             {/* ── Auth ── */}
             <section style={{ marginBottom: "2rem" }}>
                 <h2>1. Authenticate</h2>
-                {token ? (
+                {loggedIn ? (
                     <p style={{ color: "green" }}>
-                        Logged in. Token: <code>{token.slice(0, 20)}…</code>
-                        <button style={btnStyle} onClick={() => setToken("")}>
+                        Logged in as <code>{pb.authStore.record?.email}</code>
+                        <button style={btnStyle} onClick={logout}>
                             Logout
                         </button>
                     </p>
@@ -197,12 +179,12 @@ export default function DicomUploadTest() {
                         type="file"
                         accept=".dcm,application/dicom"
                         multiple
-                        disabled={!token}
+                        disabled={!loggedIn}
                     />
                     <button
                         type="submit"
                         style={btnStyle}
-                        disabled={!token || uploading}
+                        disabled={!loggedIn || uploading}
                     >
                         {uploading ? "Uploading…" : "Upload"}
                     </button>
@@ -224,7 +206,7 @@ export default function DicomUploadTest() {
                 <h2>3. List Studies</h2>
                 <button
                     style={btnStyle}
-                    disabled={!token}
+                    disabled={!loggedIn}
                     onClick={fetchStudies}
                 >
                     Fetch Studies
