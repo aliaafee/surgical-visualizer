@@ -9,6 +9,7 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/plugins/migratecmd"
 
+	_ "surgical-visualizer-server/migrations"
 	"surgical-visualizer-server/hooks"
 	"surgical-visualizer-server/routes"
 )
