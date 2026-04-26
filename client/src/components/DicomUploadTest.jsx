@@ -164,7 +164,7 @@ export default function DicomUploadTest() {
 
             {/* ── Upload ── */}
             <section style={{ marginBottom: "2rem" }}>
-                <h2>2. Upload DICOM Files</h2>
+                <h2>2. Upload DICOM Files or Directories</h2>
                 <form
                     onSubmit={upload}
                     style={{
@@ -179,6 +179,8 @@ export default function DicomUploadTest() {
                         type="file"
                         accept=".dcm,application/dicom"
                         multiple
+                        webkitdirectory=""
+                        directory=""
                         disabled={!loggedIn}
                     />
                     <button
