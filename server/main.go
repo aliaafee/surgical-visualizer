@@ -11,6 +11,8 @@ import (
 
 	"surgical-visualizer-server/hooks"
 	"surgical-visualizer-server/routes"
+
+	_ "surgical-visualizer-server/migrations"
 )
 
 func main() {
