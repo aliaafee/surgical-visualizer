@@ -272,10 +272,21 @@ func handleGetSeries(app *pocketbase.PocketBase) echo.HandlerFunc {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "series not found"})
 		}
 
-		instances, _ := app.Dao().FindRecordsByFilter(
-			"instances", "series = {:id}", "instanceNumber", 0, 0,
-			dbx.Params{"id": seriesId},
+		// Debug: log the query
+		app.Logger().Info("Fetching instances for series", "seriesId", seriesId)
+		
+		// Try fetching instances with explicit expand or direct query
+		instances, err := app.Dao().FindRecordsByFilter(
+			"instances", 
+			fmt.Sprintf("series = '%s'", seriesId), 
+			"instanceNumber", 
+			0, 
+			0,
 		)
+		
+		// Debug: log the result
+		app.Logger().Info("Found instances", "count", len(instances), "error", err)
+		
 		instanceResult := make([]map[string]interface{}, 0, len(instances))
 		for _, inst := range instances {
 			instanceResult = append(instanceResult, map[string]interface{}{

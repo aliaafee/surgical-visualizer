@@ -1,5 +1,6 @@
 import { useState, useRef } from "react";
 import PocketBase from "pocketbase";
+import DicomViewer from "./DicomViewer";
 
 const pb = new PocketBase("http://127.0.0.1:8090");
 
@@ -16,6 +17,12 @@ export default function DicomUploadTest() {
 
     const [studies, setStudies] = useState(null);
     const [studiesError, setStudiesError] = useState("");
+
+    const [selectedStudyId, setSelectedStudyId] = useState(null);
+    const [selectedStudyData, setSelectedStudyData] = useState(null);
+    const [loadingStudy, setLoadingStudy] = useState(false);
+
+    const [viewingSeriesId, setViewingSeriesId] = useState(null);
 
     const fileInputRef = useRef(null);
 
@@ -102,12 +109,57 @@ export default function DicomUploadTest() {
     async function fetchStudies() {
         setStudiesError("");
         setStudies(null);
+        setSelectedStudyId(null);
+        setSelectedStudyData(null);
         try {
             const data = await pb.send("/api/visualizer/dicom/studies", {});
+            console.log("Fetched studies:", data);
             setStudies(data);
         } catch (err) {
             setStudiesError(err.message);
         }
+    }
+
+    async function handleSelectStudy(studyId) {
+        if (selectedStudyId === studyId) {
+            // Toggle off if clicking the same study
+            setSelectedStudyId(null);
+            setSelectedStudyData(null);
+            return;
+        }
+
+        setSelectedStudyId(studyId);
+        setLoadingStudy(true);
+        try {
+            const data = await pb.send(
+                `/api/visualizer/dicom/studies/${studyId}`,
+                {},
+            );
+            console.log("Fetched study details:", data);
+            setSelectedStudyData(data);
+        } catch (err) {
+            console.error("Failed to fetch study details:", err);
+            setStudiesError(err.message);
+        } finally {
+            setLoadingStudy(false);
+        }
+    }
+
+    function handleViewSeries(seriesId) {
+        setViewingSeriesId(seriesId);
+    }
+
+    function handleCloseViewer() {
+        setViewingSeriesId(null);
+    }
+
+    if (viewingSeriesId) {
+        return (
+            <DicomViewer
+                seriesId={viewingSeriesId}
+                onClose={handleCloseViewer}
+            />
+        );
     }
 
     return (
@@ -217,7 +269,124 @@ export default function DicomUploadTest() {
                 {studies && (
                     <div style={resultBoxStyle}>
                         <strong>{studies.length} study/studies found:</strong>
-                        <pre>{JSON.stringify(studies, null, 2)}</pre>
+                        {studies.map((study, idx) => (
+                            <div key={study.id} style={studyBoxStyle}>
+                                <div
+                                    onClick={() => handleSelectStudy(study.id)}
+                                    style={{
+                                        cursor: "pointer",
+                                        padding: "0.5rem",
+                                        borderRadius: "4px",
+                                        background:
+                                            selectedStudyId === study.id
+                                                ? "#313244"
+                                                : "transparent",
+                                    }}
+                                >
+                                    <h3 style={{ margin: 0 }}>
+                                        {selectedStudyId === study.id
+                                            ? "▼"
+                                            : "▶"}{" "}
+                                        Study {idx + 1}:{" "}
+                                        {study.studyDescription ||
+                                            "No description"}
+                                    </h3>
+                                    <p style={{ margin: "4px 0" }}>
+                                        <strong>Patient:</strong>{" "}
+                                        {study.patientName || "Unknown"}
+                                        {" | "}
+                                        <strong>Date:</strong>{" "}
+                                        {study.studyDate || "Unknown"}
+                                    </p>
+                                </div>
+
+                                {selectedStudyId === study.id && (
+                                    <div style={{ marginTop: "1rem" }}>
+                                        {loadingStudy ? (
+                                            <p
+                                                style={{
+                                                    color: "#cba6f7",
+                                                    padding: "1rem",
+                                                }}
+                                            >
+                                                Loading series...
+                                            </p>
+                                        ) : selectedStudyData &&
+                                          selectedStudyData.series &&
+                                          selectedStudyData.series.length >
+                                              0 ? (
+                                            <>
+                                                <p>
+                                                    <strong>
+                                                        Series (
+                                                        {
+                                                            selectedStudyData
+                                                                .series.length
+                                                        }
+                                                        ):
+                                                    </strong>
+                                                </p>
+                                                {selectedStudyData.series.map(
+                                                    (series) => (
+                                                        <div
+                                                            key={series.id}
+                                                            style={
+                                                                seriesBoxStyle
+                                                            }
+                                                        >
+                                                            <div>
+                                                                <strong>
+                                                                    {series.seriesDescription ||
+                                                                        "No description"}
+                                                                </strong>
+                                                                <br />
+                                                                <span
+                                                                    style={{
+                                                                        fontSize:
+                                                                            "0.9em",
+                                                                        color: "#a6adc8",
+                                                                    }}
+                                                                >
+                                                                    {
+                                                                        series.modality
+                                                                    }{" "}
+                                                                    -{" "}
+                                                                    {
+                                                                        series.instanceCount
+                                                                    }{" "}
+                                                                    images
+                                                                </span>
+                                                            </div>
+                                                            <button
+                                                                style={
+                                                                    viewBtnStyle
+                                                                }
+                                                                onClick={() =>
+                                                                    handleViewSeries(
+                                                                        series.id,
+                                                                    )
+                                                                }
+                                                            >
+                                                                View Series
+                                                            </button>
+                                                        </div>
+                                                    ),
+                                                )}
+                                            </>
+                                        ) : (
+                                            <p
+                                                style={{
+                                                    padding: "1rem",
+                                                    color: "#a6adc8",
+                                                }}
+                                            >
+                                                No series found for this study.
+                                            </p>
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+                        ))}
                     </div>
                 )}
             </section>
@@ -249,4 +418,33 @@ const resultBoxStyle = {
     color: "#cdd6f4",
     borderRadius: 6,
     overflowX: "auto",
+};
+
+const studyBoxStyle = {
+    marginTop: "1rem",
+    padding: "1rem",
+    background: "#181825",
+    borderRadius: 4,
+};
+
+const seriesBoxStyle = {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: "0.75rem",
+    marginTop: "0.5rem",
+    background: "#1e1e2e",
+    borderRadius: 4,
+    border: "1px solid #313244",
+};
+
+const viewBtnStyle = {
+    padding: "6px 14px",
+    cursor: "pointer",
+    border: "1px solid #89b4fa",
+    borderRadius: 4,
+    background: "#1e1e2e",
+    color: "#89b4fa",
+    fontWeight: "bold",
+    transition: "all 0.2s",
 };
