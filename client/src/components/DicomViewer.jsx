@@ -3,14 +3,202 @@ import {
     RenderingEngine,
     Enums,
     init as csRenderInit,
+    registerImageLoader,
 } from "@cornerstonejs/core";
-import { wadouri } from "@cornerstonejs/dicom-image-loader";
 import PocketBase from "pocketbase";
+import dicomParser from "dicom-parser";
+
+// init({
+//     maxWebWorkers: navigator.hardwareConcurrency || 1,
+// });
 
 const pb = new PocketBase("http://127.0.0.1:8090");
 
-let wadoUriRoot = "http://127.0.0.1:8090";
 let isInitialized = false;
+
+function loadImageFromPb(imageId) {
+    console.log("Loading image with ID:", imageId);
+
+    const instanceId = imageId.replace("pburi:", "");
+
+    const promise = new Promise(async (resolve, reject) => {
+        try {
+            // Fetch the file from PocketBase using the instance ID
+            const fileUrl = `http://127.0.0.1:8090/api/visualizer/dicom/instances/${instanceId}/file`;
+            console.log("Fetching file from URL:", fileUrl);
+
+            const response = await fetch(fileUrl, {
+                headers: {
+                    Authorization: pb.authStore.token
+                        ? `Bearer ${pb.authStore.token}`
+                        : "",
+                },
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+
+            // Get the binary data as ArrayBuffer
+            const arrayBuffer = await response.arrayBuffer();
+            console.log(
+                "Received file, size:",
+                arrayBuffer.byteLength,
+                "bytes",
+            );
+
+            // Parse DICOM data from arrayBuffer using dicom-parser
+            const byteArray = new Uint8Array(arrayBuffer);
+            const dataSet = dicomParser.parseDicom(byteArray);
+
+            // Extract DICOM metadata
+            const rows = dataSet.uint16("x00280010");
+            const columns = dataSet.uint16("x00280011");
+            const bitsAllocated = dataSet.uint16("x00280100");
+            const bitsStored = dataSet.uint16("x00280101");
+            const pixelRepresentation = dataSet.uint16("x00280103");
+            const samplesPerPixel = dataSet.uint16("x00280002") || 1;
+
+            console.log("DICOM Metadata:", {
+                rows,
+                columns,
+                bitsAllocated,
+                bitsStored,
+                pixelRepresentation,
+                samplesPerPixel,
+            });
+
+            // Extract rescale slope and intercept
+            const slope = dataSet.floatString("x00281053") || 1;
+            const intercept = dataSet.floatString("x00281052") || 0;
+
+            // Extract window center and width
+            const windowCenter = dataSet.floatString("x00281050") || 40;
+            const windowWidth = dataSet.floatString("x00281051") || 400;
+
+            console.log("Window/Level:", {
+                windowCenter,
+                windowWidth,
+                slope,
+                intercept,
+            });
+
+            // Extract pixel spacing
+            const pixelSpacingString = dataSet.string("x00280030");
+            let rowPixelSpacing = 1;
+            let columnPixelSpacing = 1;
+            if (pixelSpacingString) {
+                const spacingValues = pixelSpacingString.split("\\");
+                rowPixelSpacing = parseFloat(spacingValues[0]) || 1;
+                columnPixelSpacing = parseFloat(spacingValues[1]) || 1;
+            }
+
+            // Extract pixel data
+            const pixelDataElement = dataSet.elements.x7fe00010;
+            if (!pixelDataElement) {
+                throw new Error("Pixel data element not found");
+            }
+
+            console.log("Pixel data element:", {
+                dataOffset: pixelDataElement.dataOffset,
+                length: pixelDataElement.length,
+            });
+
+            let pixelData;
+
+            if (bitsAllocated === 16) {
+                const isSigned = pixelRepresentation === 1;
+                if (isSigned) {
+                    pixelData = new Int16Array(
+                        byteArray.buffer,
+                        pixelDataElement.dataOffset,
+                        pixelDataElement.length / 2,
+                    );
+                } else {
+                    pixelData = new Uint16Array(
+                        byteArray.buffer,
+                        pixelDataElement.dataOffset,
+                        pixelDataElement.length / 2,
+                    );
+                }
+            } else {
+                pixelData = new Uint8Array(
+                    byteArray.buffer,
+                    pixelDataElement.dataOffset,
+                    pixelDataElement.length,
+                );
+            }
+
+            console.log("Pixel data extracted:", {
+                length: pixelData.length,
+                expected: rows * columns,
+                sample: pixelData.slice(0, 10),
+            });
+
+            // Calculate min/max pixel values from actual data
+            let minPixelValue = pixelData[0];
+            let maxPixelValue = pixelData[0];
+            for (let i = 0; i < pixelData.length; i++) {
+                if (pixelData[i] < minPixelValue) minPixelValue = pixelData[i];
+                if (pixelData[i] > maxPixelValue) maxPixelValue = pixelData[i];
+            }
+
+            console.log("Actual pixel value range:", {
+                minPixelValue,
+                maxPixelValue,
+            });
+
+            // Use actual pixel range for window/level if the DICOM values don't match
+            let finalWindowCenter = windowCenter;
+            let finalWindowWidth = windowWidth;
+
+            // If window settings are outside actual pixel range, recalculate
+            if (
+                windowCenter > maxPixelValue * 2 ||
+                windowCenter < minPixelValue
+            ) {
+                finalWindowCenter = (maxPixelValue + minPixelValue) / 2;
+                finalWindowWidth = maxPixelValue - minPixelValue;
+                console.log("Recalculated window/level based on actual data:", {
+                    finalWindowCenter,
+                    finalWindowWidth,
+                });
+            }
+
+            const image = {
+                imageId: imageId,
+                minPixelValue: minPixelValue,
+                maxPixelValue: maxPixelValue,
+                slope: slope,
+                intercept: intercept,
+                windowCenter: finalWindowCenter,
+                windowWidth: finalWindowWidth,
+                rows: rows,
+                columns: columns,
+                height: rows,
+                width: columns,
+                color: samplesPerPixel > 1,
+                rgba: false,
+                columnPixelSpacing: columnPixelSpacing,
+                rowPixelSpacing: rowPixelSpacing,
+                invert: false,
+                sizeInBytes: pixelDataElement.length,
+                getPixelData: () => pixelData,
+            };
+
+            console.log("Created image object:", image);
+
+            resolve(image);
+        } catch (err) {
+            console.error("Failed to load image:", err);
+            reject(err);
+        }
+    });
+
+    return {
+        promise,
+    };
+}
 
 async function initializeCornerstone() {
     if (isInitialized) return;
@@ -18,6 +206,9 @@ async function initializeCornerstone() {
     try {
         // Initialize Cornerstone Core
         await csRenderInit();
+
+        // Register the custom image loader for pburi scheme
+        registerImageLoader("pburi", loadImageFromPb);
 
         isInitialized = true;
         console.log("Cornerstone initialized successfully");
@@ -33,6 +224,10 @@ export default function DicomViewer({ seriesId, onClose }) {
     const [error, setError] = useState("");
     const [currentImageIndex, setCurrentImageIndex] = useState(0);
     const [initialized, setInitialized] = useState(false);
+    const [currentImageDimensions, setCurrentImageDimensions] = useState({
+        rows: 0,
+        columns: 0,
+    });
 
     const viewportRef = useRef(null);
     const renderingEngineRef = useRef(null);
@@ -116,15 +311,17 @@ export default function DicomViewer({ seriesId, onClose }) {
 
         const element = viewportRef.current;
 
-        // Create image IDs using wadouri scheme with authentication token
+        // Create image IDs using pburi scheme with authentication token
         const imageIds = seriesData.instances.map((instance) => {
-            const fileUrl = `${wadoUriRoot}/api/visualizer/dicom/instances/${instance.id}/file`;
+            // const fileUrl = `${wadoUriRoot}/api/visualizer/dicom/instances/${instance.id}/file`;
             // Include the auth token in the URL
-            const urlWithAuth = `${fileUrl}?token=${encodeURIComponent(pb.authStore.token || "")}`;
-            return `wadouri:${urlWithAuth}`;
+            // const urlWithAuth = `${fileUrl}?token=${encodeURIComponent(pb.authStore.token || "")}`;
+            return `pburi:${instance?.id}`;
         });
 
         console.log("Loading images:", imageIds.length, "imageIds");
+
+        console.log("Image IDs:", imageIds);
 
         // Create rendering engine
         const renderingEngineId = "myRenderingEngine";
@@ -150,6 +347,14 @@ export default function DicomViewer({ seriesId, onClose }) {
             .setStack(imageIds, 0)
             .then(() => {
                 viewport.render();
+                // Update dimensions from the loaded image
+                const image = viewport.getImageData();
+                if (image) {
+                    setCurrentImageDimensions({
+                        rows: image.dimensions[0],
+                        columns: image.dimensions[1],
+                    });
+                }
             })
             .catch((err) => {
                 console.error("Failed to set stack:", err);
@@ -176,6 +381,15 @@ export default function DicomViewer({ seriesId, onClose }) {
         if (currentIndex > 0) {
             viewport.setImageIdIndex(currentIndex - 1);
             setCurrentImageIndex(currentIndex - 1);
+
+            // Update dimensions
+            const image = viewport.getImageData();
+            if (image) {
+                setCurrentImageDimensions({
+                    rows: image.dimensions[0],
+                    columns: image.dimensions[1],
+                });
+            }
         }
     };
 
@@ -191,6 +405,15 @@ export default function DicomViewer({ seriesId, onClose }) {
         if (currentIndex < maxIndex) {
             viewport.setImageIdIndex(currentIndex + 1);
             setCurrentImageIndex(currentIndex + 1);
+
+            // Update dimensions
+            const image = viewport.getImageData();
+            if (image) {
+                setCurrentImageDimensions({
+                    rows: image.dimensions[0],
+                    columns: image.dimensions[1],
+                });
+            }
         }
     };
 
@@ -203,6 +426,15 @@ export default function DicomViewer({ seriesId, onClose }) {
         );
         viewport.setImageIdIndex(newIndex);
         setCurrentImageIndex(newIndex);
+
+        // Update dimensions
+        const image = viewport.getImageData();
+        if (image) {
+            setCurrentImageDimensions({
+                rows: image.dimensions[0],
+                columns: image.dimensions[1],
+            });
+        }
     };
 
     if (loading) {
@@ -309,8 +541,8 @@ export default function DicomViewer({ seriesId, onClose }) {
                     <strong>Instances:</strong> {seriesData.instanceCount}
                 </p>
                 <p>
-                    <strong>Dimensions:</strong> {seriesData.rows} ×{" "}
-                    {seriesData.columns}
+                    <strong>Dimensions:</strong> {currentImageDimensions.rows} ×{" "}
+                    {currentImageDimensions.columns}
                 </p>
                 {seriesData.pixelSpacing && (
                     <p>
