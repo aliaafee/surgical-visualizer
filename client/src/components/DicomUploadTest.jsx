@@ -1,8 +1,6 @@
 import { useState, useRef } from "react";
-import PocketBase from "pocketbase";
 import DicomViewer from "./DicomViewer";
-
-const pb = new PocketBase("http://127.0.0.1:8090");
+import { pb } from "@/lib/pb";
 
 export default function DicomUploadTest() {
     const [loggedIn, setLoggedIn] = useState(pb.authStore.isValid);
