@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -25,6 +26,7 @@ func RegisterDicomRoutes(app *pocketbase.PocketBase, e *core.ServeEvent) error {
 	e.Router.POST("/api/visualizer/dicom/upload", handleUpload(app), auth)
 	e.Router.GET("/api/visualizer/dicom/studies", handleListStudies(app), auth)
 	e.Router.GET("/api/visualizer/dicom/studies/:studyId", handleGetStudy(app), auth)
+	e.Router.POST("/api/visualizer/dicom/studies/:studyId/anonymize", handleAnonymizeStudy(app), auth)
 	e.Router.GET("/api/visualizer/dicom/series/:seriesId", handleGetSeries(app), auth)
 	e.Router.GET("/api/visualizer/dicom/instances/:instanceId/metadata", handleGetInstanceMetadata(app), auth)
 	e.Router.GET("/api/visualizer/dicom/instances/:instanceId/file", handleGetInstanceFile(app), auth)
@@ -37,6 +39,8 @@ func RegisterDicomRoutes(app *pocketbase.PocketBase, e *core.ServeEvent) error {
 // handleUpload accepts one or more .dcm files under the "files" multipart field.
 // For each file it: parses DICOM metadata, upserts Study/Series records, creates
 // an Instance record, and persists the raw file to PocketBase storage.
+// With the form value anonymize=true, identifying attributes are stripped from
+// each file before anything is stored.
 func handleUpload(app *pocketbase.PocketBase) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		if err := c.Request().ParseMultipartForm(512 << 20); err != nil {
@@ -52,6 +56,8 @@ func handleUpload(app *pocketbase.PocketBase) echo.HandlerFunc {
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "instances collection not found"})
 		}
+
+		anonymize := c.FormValue("anonymize") == "true"
 
 		type instanceResult struct {
 			ID            string `json:"id"`
@@ -72,7 +78,8 @@ func handleUpload(app *pocketbase.PocketBase) echo.HandlerFunc {
 
 		result := uploadResult{}
 		seenSeries := map[string]seriesResult{}
-		var studyRecord *models.Record
+		seriesRecords := map[string]*models.Record{}
+		seenStudies := map[string]bool{}
 		var errs []string
 
 		for _, fh := range fileHeaders {
@@ -94,12 +101,40 @@ func handleUpload(app *pocketbase.PocketBase) echo.HandlerFunc {
 				continue
 			}
 
-			study, err := upsertStudy(app, dataset)
+			// An anonymized study must stay anonymized, and identity already
+			// stored for a study can't be hidden by anonymizing later files.
+			existingStudy, _ := app.Dao().FindFirstRecordByFilter(
+				"studies", "studyInstanceUID = {:uid}",
+				dbx.Params{"uid": getStringDICOMTag(dataset, tag.StudyInstanceUID)},
+			)
+			anonymizeFile := anonymize
+			if existingStudy != nil {
+				if anonymize && !existingStudy.GetBool("isAnonymized") {
+					errs = append(errs, fmt.Sprintf("%s: study was already uploaded without anonymization; anonymize the existing study first", fh.Filename))
+					continue
+				}
+				anonymizeFile = existingStudy.GetBool("isAnonymized")
+			}
+
+			if anonymizeFile {
+				fileBytes, err = anonymizeDICOM(fileBytes)
+				if err != nil {
+					errs = append(errs, fmt.Sprintf("%s: anonymization failed: %v", fh.Filename, err))
+					continue
+				}
+				dataset, err = dicom.Parse(bytes.NewReader(fileBytes), int64(len(fileBytes)), nil, dicom.SkipPixelData())
+				if err != nil {
+					errs = append(errs, fmt.Sprintf("%s: anonymization produced an invalid file: %v", fh.Filename, err))
+					continue
+				}
+			}
+
+			study, err := upsertStudy(app, dataset, anonymizeFile)
 			if err != nil {
 				errs = append(errs, fmt.Sprintf("%s: study error: %v", fh.Filename, err))
 				continue
 			}
-			studyRecord = study
+			seenStudies[study.Id] = true
 			result.StudyID = study.Id
 			result.StudyInstanceUID = study.GetString("studyInstanceUID")
 
@@ -112,6 +147,7 @@ func handleUpload(app *pocketbase.PocketBase) echo.HandlerFunc {
 				ID:                series.Id,
 				SeriesInstanceUID: series.GetString("seriesInstanceUID"),
 			}
+			seriesRecords[series.Id] = series
 
 			sopUID := getStringDICOMTag(dataset, tag.SOPInstanceUID)
 
@@ -128,16 +164,8 @@ func handleUpload(app *pocketbase.PocketBase) echo.HandlerFunc {
 			instRecord := models.NewRecord(instanceCollection)
 			instRecord.Set("sopInstanceUID", sopUID)
 			instRecord.Set("series", series.Id)
-			instRecord.Set("instanceNumber", parseIntDICOMTag(dataset, tag.InstanceNumber))
-			instRecord.Set("sliceLocation", parseFloatDICOMTag(dataset, tag.SliceLocation))
-			instRecord.Set("windowCenter", parseFloatDICOMTag(dataset, tag.WindowCenter))
-			instRecord.Set("windowWidth", parseFloatDICOMTag(dataset, tag.WindowWidth))
-			instRecord.Set("rescaleIntercept", parseFloatDICOMTag(dataset, tag.RescaleIntercept))
-			instRecord.Set("rescaleSlope", parseFloatDICOMTag(dataset, tag.RescaleSlope))
-			instRecord.Set("fileSize", len(fileBytes))
-			instRecord.Set("transferSyntax", getStringDICOMTag(dataset, tag.Tag{Group: 0x0002, Element: 0x0010}))
 			instRecord.Set("dicomFile", filename)
-			instRecord.Set("metadata", buildMetadata(dataset))
+			applyInstanceFields(instRecord, dataset, len(fileBytes))
 
 			if err := app.Dao().SaveRecord(instRecord); err != nil {
 				errs = append(errs, fmt.Sprintf("%s: failed to save instance: %v", fh.Filename, err))
@@ -164,12 +192,25 @@ func handleUpload(app *pocketbase.PocketBase) echo.HandlerFunc {
 			result.Series = append(result.Series, sr)
 		}
 
-		// Update study-level counts and mark as complete.
-		if studyRecord != nil {
-			studyRecord.Set("seriesCount", len(seenSeries))
-			studyRecord.Set("instanceCount", len(result.Instances))
-			studyRecord.Set("uploadStatus", "complete")
-			_ = app.Dao().SaveRecord(studyRecord)
+		// Recompute series geometry/counts and study-level counts from what is
+		// actually stored, so uploads split across several requests add up.
+		if len(seriesRecords) > 0 {
+			fsys, err := app.NewFilesystem()
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("series post-processing skipped, filesystem unavailable: %v", err))
+			} else {
+				for _, series := range seriesRecords {
+					if err := finalizeSeries(app, fsys, series); err != nil {
+						errs = append(errs, fmt.Sprintf("series %s: post-processing failed: %v", series.Id, err))
+					}
+				}
+				fsys.Close()
+			}
+		}
+		for studyId := range seenStudies {
+			if err := refreshStudyStats(app, studyId); err != nil {
+				errs = append(errs, fmt.Sprintf("study %s: failed to update counts: %v", studyId, err))
+			}
 		}
 
 		result.Errors = errs
@@ -200,6 +241,7 @@ func handleListStudies(app *pocketbase.PocketBase) echo.HandlerFunc {
 				"studyDescription": r.GetString("studyDescription"),
 				"modality":         r.GetString("modality"),
 				"uploadStatus":     r.GetString("uploadStatus"),
+				"isAnonymized":     r.GetBool("isAnonymized"),
 				"seriesCount":      r.Get("seriesCount"),
 				"instanceCount":    r.Get("instanceCount"),
 				"totalSize":        r.Get("totalSize"),
@@ -220,9 +262,13 @@ func handleGetStudy(app *pocketbase.PocketBase) echo.HandlerFunc {
 		}
 
 		seriesList, _ := app.Dao().FindRecordsByFilter(
-			"series", "study = {:id}", "seriesNumber", 0, 0,
+			"series", "study = {:id}", "", 0, 0,
 			dbx.Params{"id": studyId},
 		)
+		// seriesNumber is a text field, so order numerically here.
+		sort.SliceStable(seriesList, func(i, j int) bool {
+			return seriesList[i].GetInt("seriesNumber") < seriesList[j].GetInt("seriesNumber")
+		})
 		seriesResult := make([]map[string]interface{}, 0, len(seriesList))
 		for _, s := range seriesList {
 			seriesResult = append(seriesResult, map[string]interface{}{
@@ -233,6 +279,8 @@ func handleGetStudy(app *pocketbase.PocketBase) echo.HandlerFunc {
 				"modality":          s.GetString("modality"),
 				"bodyPartExamined":  s.GetString("bodyPartExamined"),
 				"instanceCount":     s.Get("instanceCount"),
+				"rows":              s.Get("rows"),
+				"columns":           s.Get("columns"),
 				"is3DCapable":       s.GetBool("is3DCapable"),
 				"processingStatus":  s.GetString("processingStatus"),
 			})
@@ -272,21 +320,11 @@ func handleGetSeries(app *pocketbase.PocketBase) echo.HandlerFunc {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "series not found"})
 		}
 
-		// Debug: log the query
-		app.Logger().Info("Fetching instances for series", "seriesId", seriesId)
-		
-		// Try fetching instances with explicit expand or direct query
-		instances, err := app.Dao().FindRecordsByFilter(
-			"instances", 
-			fmt.Sprintf("series = '%s'", seriesId), 
-			"instanceNumber", 
-			0, 
-			0,
+		instances, _ := app.Dao().FindRecordsByFilter(
+			"instances", "series = {:id}", "instanceNumber", 0, 0,
+			dbx.Params{"id": seriesId},
 		)
-		
-		// Debug: log the result
-		app.Logger().Info("Found instances", "count", len(instances), "error", err)
-		
+
 		instanceResult := make([]map[string]interface{}, 0, len(instances))
 		for _, inst := range instances {
 			instanceResult = append(instanceResult, map[string]interface{}{
@@ -294,10 +332,29 @@ func handleGetSeries(app *pocketbase.PocketBase) echo.HandlerFunc {
 				"sopInstanceUID": inst.GetString("sopInstanceUID"),
 				"instanceNumber": inst.Get("instanceNumber"),
 				"sliceLocation":  inst.Get("sliceLocation"),
+				"imagePosition":  inst.Get("imagePosition"),
 				"windowCenter":   inst.Get("windowCenter"),
 				"windowWidth":    inst.Get("windowWidth"),
 				"fileSize":       inst.Get("fileSize"),
+				"transferSyntax": inst.GetString("transferSyntax"),
+				"metadata":       inst.Get("metadata"),
 			})
+		}
+
+		var studyResult map[string]interface{}
+		if study, err := app.Dao().FindRecordById("studies", series.GetString("study")); err == nil {
+			studyResult = map[string]interface{}{
+				"id":               study.Id,
+				"patientID":        study.GetString("patientID"),
+				"patientName":      study.GetString("patientName"),
+				"patientBirthDate": study.GetString("patientBirthDate"),
+				"patientSex":       study.GetString("patientSex"),
+				"studyDate":        study.GetString("studyDate"),
+				"studyDescription": study.GetString("studyDescription"),
+				"accessionNumber":  study.GetString("accessionNumber"),
+				"institutionName":  study.GetString("institutionName"),
+				"isAnonymized":     study.GetBool("isAnonymized"),
+			}
 		}
 
 		return c.JSON(http.StatusOK, map[string]interface{}{
@@ -312,10 +369,12 @@ func handleGetSeries(app *pocketbase.PocketBase) echo.HandlerFunc {
 			"rows":              series.Get("rows"),
 			"columns":           series.Get("columns"),
 			"sliceThickness":    series.Get("sliceThickness"),
+			"sliceSpacing":      series.Get("sliceSpacing"),
 			"pixelSpacing":      series.Get("pixelSpacing"),
 			"imageOrientation":  series.Get("imageOrientation"),
 			"is3DCapable":       series.GetBool("is3DCapable"),
 			"processingStatus":  series.GetString("processingStatus"),
+			"study":             studyResult,
 			"instances":         instanceResult,
 		})
 	}
@@ -369,7 +428,7 @@ func handleGetInstanceFile(app *pocketbase.PocketBase) echo.HandlerFunc {
 
 // ─── Upsert helpers ───────────────────────────────────────────────────────────
 
-func upsertStudy(app *pocketbase.PocketBase, dataset dicom.Dataset) (*models.Record, error) {
+func upsertStudy(app *pocketbase.PocketBase, dataset dicom.Dataset, anonymized bool) (*models.Record, error) {
 	studyUID := getStringDICOMTag(dataset, tag.StudyInstanceUID)
 	if studyUID == "" {
 		return nil, fmt.Errorf("missing StudyInstanceUID")
@@ -392,6 +451,8 @@ func upsertStudy(app *pocketbase.PocketBase, dataset dicom.Dataset) (*models.Rec
 	record.Set("studyInstanceUID", studyUID)
 	record.Set("patientID", getStringDICOMTag(dataset, tag.PatientID))
 	record.Set("patientName", getStringDICOMTag(dataset, tag.PatientName))
+	record.Set("patientBirthDate", formatDICOMDate(getStringDICOMTag(dataset, tag.PatientBirthDate)))
+	record.Set("patientSex", getStringDICOMTag(dataset, tag.PatientSex))
 	record.Set("studyDate", formatDICOMDate(getStringDICOMTag(dataset, tag.StudyDate)))
 	record.Set("studyTime", getStringDICOMTag(dataset, tag.StudyTime))
 	record.Set("studyDescription", getStringDICOMTag(dataset, tag.StudyDescription))
@@ -400,7 +461,7 @@ func upsertStudy(app *pocketbase.PocketBase, dataset dicom.Dataset) (*models.Rec
 	record.Set("referringPhysician", getStringDICOMTag(dataset, tag.ReferringPhysicianName))
 	record.Set("institutionName", getStringDICOMTag(dataset, tag.InstitutionName))
 	record.Set("uploadStatus", "processing")
-	record.Set("isAnonymized", false)
+	record.Set("isAnonymized", anonymized)
 	record.Set("seriesCount", 0)
 	record.Set("instanceCount", 0)
 
@@ -500,6 +561,13 @@ func buildMetadata(dataset dicom.Dataset) map[string]interface{} {
 		"bitsStored":                 parseIntDICOMTag(dataset, tag.BitsStored),
 		"pixelRepresentation":        parseIntDICOMTag(dataset, tag.PixelRepresentation),
 		"photometricInterpretation":  getStringDICOMTag(dataset, tag.PhotometricInterpretation),
+		"rows":                       parseIntDICOMTag(dataset, tag.Rows),
+		"columns":                    parseIntDICOMTag(dataset, tag.Columns),
+		"samplesPerPixel":            parseIntDICOMTag(dataset, tag.SamplesPerPixel),
+		"sliceThickness":             parseFloatDICOMTag(dataset, tag.SliceThickness),
+		"pixelSpacing":               parseFloatsDICOMTag(dataset, tag.PixelSpacing),
+		"imageOrientation":           parseFloatsDICOMTag(dataset, tag.ImageOrientationPatient),
+		"imagePosition":              parseFloatsDICOMTag(dataset, tag.ImagePositionPatient),
 	}
 }
 
@@ -526,8 +594,41 @@ func parseFloatDICOMTag(dataset dicom.Dataset, t tag.Tag) float64 {
 	return v
 }
 
-// parseIntDICOMTag returns the int value for a DICOM integer string tag.
+// parseFloatsDICOMTag returns every value of a multi-valued DICOM decimal
+// string tag (e.g. ImagePositionPatient), or nil if absent or malformed.
+func parseFloatsDICOMTag(dataset dicom.Dataset, t tag.Tag) []float64 {
+	elem, err := dataset.FindElementByTag(t)
+	if err != nil {
+		return nil
+	}
+	vals, ok := elem.Value.GetValue().([]string)
+	if !ok {
+		return nil
+	}
+	result := make([]float64, 0, len(vals))
+	for _, s := range vals {
+		v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+		if err != nil {
+			return nil
+		}
+		result = append(result, v)
+	}
+	return result
+}
+
+// parseIntDICOMTag returns the int value for a DICOM tag stored either as an
+// integer string (IS) or as a binary integer (US/SS/UL/SL), or 0 if absent.
 func parseIntDICOMTag(dataset dicom.Dataset, t tag.Tag) int {
+	elem, err := dataset.FindElementByTag(t)
+	if err != nil {
+		return 0
+	}
+	if ints, ok := elem.Value.GetValue().([]int); ok {
+		if len(ints) == 0 {
+			return 0
+		}
+		return ints[0]
+	}
 	s := getStringDICOMTag(dataset, t)
 	if s == "" {
 		return 0

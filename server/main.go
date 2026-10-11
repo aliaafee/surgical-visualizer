@@ -38,6 +38,12 @@ func main() {
 		return routes.RegisterDicomRoutes(app, e)
 	})
 
+	// Finish processing series stored before post-processing existed
+	app.OnBeforeServe().Add(func(e *core.ServeEvent) error {
+		go routes.BackfillSeries(app)
+		return nil
+	})
+
 	// Serve static files from pb_public directory
 	app.OnBeforeServe().Add(func(e *core.ServeEvent) error {
 		// Serve static files from pb_public directory

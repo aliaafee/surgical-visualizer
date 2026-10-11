@@ -45,18 +45,18 @@ A web-based application for real-time 3D volume rendering of DICOM medical image
 
 #### DICOM Management
 
-- [ ] DICOM file upload (drag-and-drop)
-- [ ] DICOM parsing and validation
-- [ ] Metadata extraction and display
-- [ ] Series/Study organization
-- [ ] Patient data anonymization
+- [x] DICOM file upload (drag-and-drop)
+- [x] DICOM parsing and validation
+- [x] Metadata extraction and display
+- [x] Series/Study organization
+- [x] Patient data anonymization
 
 #### Basic Visualization
 
-- [ ] 2D slice viewer (axial, sagittal, coronal)
-- [ ] Window/level adjustment
-- [ ] Zoom, pan, and rotate controls
-- [ ] Slice navigation
+- [x] 2D slice viewer (axial, sagittal, coronal)
+- [x] Window/level adjustment
+- [x] Zoom, pan, and rotate controls
+- [x] Slice navigation
 
 ### Phase 2: 3D Rendering (Weeks 5-8)
 

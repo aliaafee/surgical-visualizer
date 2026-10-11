@@ -1,6 +1,13 @@
 import { useState, useRef } from "react";
 import DicomViewer from "./DicomViewer";
 import { pb } from "@/lib/pb";
+import { collectDroppedFiles } from "@/lib/dropped-files";
+
+function formatSize(bytes) {
+    if (!bytes) return "";
+    if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(2)} GB`;
+    return `${(bytes / 1e6).toFixed(1)} MB`;
+}
 
 export default function DicomUploadTest() {
     const [loggedIn, setLoggedIn] = useState(pb.authStore.isValid);
@@ -12,6 +19,10 @@ export default function DicomUploadTest() {
     const [uploadProgress, setUploadProgress] = useState("");
     const [uploadResult, setUploadResult] = useState(null);
     const [uploadError, setUploadError] = useState("");
+    const [pendingFiles, setPendingFiles] = useState([]);
+    const [anonymize, setAnonymize] = useState(false);
+    const [dragActive, setDragActive] = useState(false);
+    const [anonymizingStudyId, setAnonymizingStudyId] = useState(null);
 
     const [studies, setStudies] = useState(null);
     const [studiesError, setStudiesError] = useState("");
@@ -42,9 +53,23 @@ export default function DicomUploadTest() {
 
     const CHUNK_SIZE = 10;
 
+    async function handleDrop(e) {
+        e.preventDefault();
+        setDragActive(false);
+        if (!loggedIn || uploading) return;
+
+        try {
+            const files = await collectDroppedFiles(e.dataTransfer);
+            setPendingFiles(files);
+            if (fileInputRef.current) fileInputRef.current.value = "";
+        } catch (err) {
+            setUploadError(`Could not read dropped files: ${err.message}`);
+        }
+    }
+
     async function upload(e) {
         e.preventDefault();
-        const files = Array.from(fileInputRef.current?.files ?? []);
+        const files = pendingFiles;
         if (files.length === 0) return;
 
         setUploading(true);
@@ -76,6 +101,7 @@ export default function DicomUploadTest() {
                 for (const file of chunks[i]) {
                     form.append("files", file);
                 }
+                if (anonymize) form.append("anonymize", "true");
                 const data = await pb.send("/api/visualizer/dicom/upload", {
                     method: "POST",
                     body: form,
@@ -96,6 +122,9 @@ export default function DicomUploadTest() {
             }
 
             setUploadResult(merged);
+            setPendingFiles([]);
+            if (fileInputRef.current) fileInputRef.current.value = "";
+            fetchStudies();
         } catch (err) {
             setUploadError(err.message);
         } finally {
@@ -140,6 +169,32 @@ export default function DicomUploadTest() {
             setStudiesError(err.message);
         } finally {
             setLoadingStudy(false);
+        }
+    }
+
+    async function handleAnonymizeStudy(study) {
+        const confirmed = window.confirm(
+            `Anonymize "${study.studyDescription || "this study"}"?\n\n` +
+                "Patient details are permanently removed from every stored file. " +
+                "This cannot be undone. Text burned into images is not removed.",
+        );
+        if (!confirmed) return;
+
+        setStudiesError("");
+        setAnonymizingStudyId(study.id);
+        try {
+            await pb.send(
+                `/api/visualizer/dicom/studies/${study.id}/anonymize`,
+                { method: "POST" },
+            );
+            await fetchStudies();
+        } catch (err) {
+            const details = err.response?.errors?.slice(0, 3).join("; ");
+            setStudiesError(
+                `Anonymization failed: ${details || err.message}`,
+            );
+        } finally {
+            setAnonymizingStudyId(null);
         }
     }
 
@@ -224,19 +279,63 @@ export default function DicomUploadTest() {
                         flexWrap: "wrap",
                     }}
                 >
-                    <input
-                        ref={fileInputRef}
-                        type="file"
-                        accept=".dcm,application/dicom"
-                        multiple
-                        webkitdirectory=""
-                        directory=""
-                        disabled={!loggedIn}
-                    />
+                    <div
+                        onDragOver={(e) => {
+                            e.preventDefault();
+                            if (loggedIn && !uploading) setDragActive(true);
+                        }}
+                        onDragLeave={() => setDragActive(false)}
+                        onDrop={handleDrop}
+                        style={{
+                            ...dropZoneStyle,
+                            borderColor: dragActive ? "#89b4fa" : "#555",
+                            background: dragActive ? "#313244" : "#1e1e2e",
+                            opacity: loggedIn ? 1 : 0.5,
+                        }}
+                    >
+                        <p style={{ margin: "0 0 0.5rem" }}>
+                            Drag and drop DICOM files or folders here, or
+                            choose a folder:
+                        </p>
+                        <input
+                            ref={fileInputRef}
+                            type="file"
+                            accept=".dcm,application/dicom"
+                            multiple
+                            webkitdirectory=""
+                            directory=""
+                            disabled={!loggedIn || uploading}
+                            onChange={(e) =>
+                                setPendingFiles(Array.from(e.target.files))
+                            }
+                        />
+                        {pendingFiles.length > 0 && (
+                            <p style={{ margin: "0.5rem 0 0" }}>
+                                {pendingFiles.length} file(s) ready to upload
+                            </p>
+                        )}
+                    </div>
+                    <label
+                        style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 6,
+                        }}
+                    >
+                        <input
+                            type="checkbox"
+                            checked={anonymize}
+                            onChange={(e) => setAnonymize(e.target.checked)}
+                            disabled={!loggedIn || uploading}
+                        />
+                        Anonymize patient data before storing
+                    </label>
                     <button
                         type="submit"
                         style={btnStyle}
-                        disabled={!loggedIn || uploading}
+                        disabled={
+                            !loggedIn || uploading || pendingFiles.length === 0
+                        }
                     >
                         {uploading ? "Uploading…" : "Upload"}
                     </button>
@@ -294,9 +393,42 @@ export default function DicomUploadTest() {
                                         {study.patientName || "Unknown"}
                                         {" | "}
                                         <strong>Date:</strong>{" "}
-                                        {study.studyDate || "Unknown"}
+                                        {study.studyDate?.slice(0, 10) ||
+                                            "Unknown"}
+                                    </p>
+                                    <p
+                                        style={{
+                                            margin: "4px 0",
+                                            fontSize: "0.9em",
+                                            color: "#a6adc8",
+                                        }}
+                                    >
+                                        {study.seriesCount || 0} series ·{" "}
+                                        {study.instanceCount || 0} images
+                                        {study.totalSize
+                                            ? ` · ${formatSize(study.totalSize)}`
+                                            : ""}
+                                        {study.isAnonymized && " · Anonymized"}
                                     </p>
                                 </div>
+                                {!study.isAnonymized && (
+                                    <button
+                                        style={{
+                                            ...btnStyle,
+                                            marginTop: "0.5rem",
+                                        }}
+                                        disabled={
+                                            anonymizingStudyId !== null
+                                        }
+                                        onClick={() =>
+                                            handleAnonymizeStudy(study)
+                                        }
+                                    >
+                                        {anonymizingStudyId === study.id
+                                            ? "Anonymizing…"
+                                            : "Anonymize study"}
+                                    </button>
+                                )}
 
                                 {selectedStudyId === study.id && (
                                     <div style={{ marginTop: "1rem" }}>
@@ -349,10 +481,11 @@ export default function DicomUploadTest() {
                                                                         series.modality
                                                                     }{" "}
                                                                     -{" "}
-                                                                    {
-                                                                        series.instanceCount
-                                                                    }{" "}
+                                                                    {series.instanceCount ||
+                                                                        0}{" "}
                                                                     images
+                                                                    {series.is3DCapable &&
+                                                                        " - multi-planar"}
                                                                 </span>
                                                             </div>
                                                             <button
@@ -398,6 +531,14 @@ const btnStyle = {
     border: "1px solid #555",
     borderRadius: 4,
     background: "#1e1e2e",
+    color: "#cdd6f4",
+};
+
+const dropZoneStyle = {
+    flexBasis: "100%",
+    padding: "1rem",
+    border: "2px dashed #555",
+    borderRadius: 6,
     color: "#cdd6f4",
 };
 
