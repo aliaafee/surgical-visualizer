@@ -32,6 +32,7 @@ export default function DicomUploadTest() {
     const [loadingStudy, setLoadingStudy] = useState(false);
 
     const [viewingSeriesId, setViewingSeriesId] = useState(null);
+    const [viewingMode, setViewingMode] = useState("stack");
 
     const fileInputRef = useRef(null);
 
@@ -198,7 +199,9 @@ export default function DicomUploadTest() {
         }
     }
 
-    function handleViewSeries(seriesId) {
+    // mode is "stack" (slice by slice) or "mpr" (multi-planar)
+    function handleViewSeries(seriesId, mode) {
+        setViewingMode(mode);
         setViewingSeriesId(seriesId);
     }
 
@@ -210,6 +213,7 @@ export default function DicomUploadTest() {
         return (
             <DicomViewer
                 seriesId={viewingSeriesId}
+                mode={viewingMode}
                 onClose={handleCloseViewer}
             />
         );
@@ -488,18 +492,43 @@ export default function DicomUploadTest() {
                                                                         " - multi-planar"}
                                                                 </span>
                                                             </div>
-                                                            <button
-                                                                style={
-                                                                    viewBtnStyle
-                                                                }
-                                                                onClick={() =>
-                                                                    handleViewSeries(
-                                                                        series.id,
-                                                                    )
-                                                                }
+                                                            <div
+                                                                style={{
+                                                                    display:
+                                                                        "flex",
+                                                                    gap: 8,
+                                                                }}
                                                             >
-                                                                View Series
-                                                            </button>
+                                                                <button
+                                                                    style={
+                                                                        viewBtnStyle
+                                                                    }
+                                                                    onClick={() =>
+                                                                        handleViewSeries(
+                                                                            series.id,
+                                                                            "stack",
+                                                                        )
+                                                                    }
+                                                                >
+                                                                    View Series
+                                                                </button>
+                                                                {series.is3DCapable && (
+                                                                    <button
+                                                                        style={
+                                                                            viewBtnStyle
+                                                                        }
+                                                                        onClick={() =>
+                                                                            handleViewSeries(
+                                                                                series.id,
+                                                                                "mpr",
+                                                                            )
+                                                                        }
+                                                                    >
+                                                                        Open in
+                                                                        MPR
+                                                                    </button>
+                                                                )}
+                                                            </div>
                                                         </div>
                                                     ),
                                                 )}

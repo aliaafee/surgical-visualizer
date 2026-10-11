@@ -199,7 +199,9 @@ function formatNumbers(values, digits = 3) {
     return values.map((v) => Number(v).toFixed(digits)).join(" × ");
 }
 
-export default function DicomViewer({ seriesId, onClose }) {
+// mode "mpr" opens the series in the multi-planar view when it forms a volume;
+// "stack" (the default) always shows it slice by slice
+export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
     const [seriesData, setSeriesData] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState("");
@@ -223,7 +225,8 @@ export default function DicomViewer({ seriesId, onClose }) {
     const activeToolRef = useRef(activeTool);
     const slabSettingsRef = useRef(slabSettings);
 
-    const isVolume = Boolean(seriesData?.is3DCapable) && !forceStack;
+    const isVolume =
+        mode === "mpr" && Boolean(seriesData?.is3DCapable) && !forceStack;
     const viewports = isVolume ? MPR_VIEWPORTS : STACK_VIEWPORTS;
     // Window presets are in Hounsfield units, so greyscale CT only
     const isCT =
