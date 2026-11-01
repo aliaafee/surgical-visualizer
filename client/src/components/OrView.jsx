@@ -1,0 +1,1630 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+import {
+    RenderingEngine,
+    Enums,
+    cache,
+    metaData,
+    volumeLoader,
+    utilities as csUtils,
+} from "@cornerstonejs/core";
+import { wadouri } from "@cornerstonejs/dicom-image-loader";
+import {
+    ToolGroupManager,
+    WindowLevelTool,
+    PanTool,
+    ZoomTool,
+    StackScrollTool,
+} from "@cornerstonejs/tools";
+import { pb } from "@/lib/pb";
+import ViewportSettings from "./ViewportSettings";
+import {
+    DEFAULT_SLAB,
+    slabLabel,
+    applySlabToViewport,
+    applyWindowToViewport,
+} from "@/lib/viewport-settings";
+import {
+    initializeCornerstone,
+    instanceImageId,
+    applyToolBindings,
+    loadImages,
+    VIEWER_TOOLS,
+} from "@/lib/cornerstone";
+
+const STORAGE_KEY = "or-view-layout";
+const MAX_GRID = 4;
+// PocketBase cancels an in-flight request when an identical one is sent, but
+// several cells can legitimately ask for the same thing at once
+const NO_AUTO_CANCEL = { requestKey: null };
+
+// What a cell can show: the series slice by slice, or one plane of its volume
+const VIEWS = [
+    { id: "stack", label: "Stack" },
+    {
+        id: "axial",
+        label: "MPR Axial",
+        orientation: Enums.OrientationAxis.AXIAL,
+    },
+    {
+        id: "sagittal",
+        label: "MPR Sagittal",
+        orientation: Enums.OrientationAxis.SAGITTAL,
+    },
+    {
+        id: "coronal",
+        label: "MPR Coronal",
+        orientation: Enums.OrientationAxis.CORONAL,
+    },
+];
+
+const TOOLS = [
+    { name: WindowLevelTool.toolName, label: "Window/Level" },
+    { name: PanTool.toolName, label: "Pan" },
+    { name: ZoomTool.toolName, label: "Zoom" },
+    { name: StackScrollTool.toolName, label: "Scroll" },
+];
+
+// Colours handed out to cells for their section line and title. Each stays
+// readable over a greyscale image and is distinct from the others.
+const CELL_COLORS = [
+    "#f05a5a",
+    "#f0c83c",
+    "#5ac86e",
+    "#78c8ff",
+    "#ff8c42",
+    "#c792ea",
+    "#4dd0e1",
+    "#f48fb1",
+    "#ffffff",
+    "#ffd54f",
+    "#9fa8da",
+    "#80cbc4",
+    "#ff7043",
+    "#ba68c8",
+    "#a1887f",
+    "#90caf9",
+];
+const MAX_NAME_LENGTH = 24;
+
+// A random colour that no other cell is using
+function pickCellColor(cells) {
+    const used = new Set(cells.map((cell) => cell?.color).filter(Boolean));
+    const free = CELL_COLORS.filter((color) => !used.has(color));
+    const pool = free.length ? free : CELL_COLORS;
+    return pool[Math.floor(Math.random() * pool.length)];
+}
+
+// What a cell is called on its own title and on its section lines
+function cellName(content, index) {
+    return content?.name?.trim() || String(index + 1);
+}
+// Half length (mm) of a reference line before it is clipped to the cell
+const REFERENCE_LINE_REACH = 5000;
+// How far a line's rotation handles sit from its middle, as a share of the
+// cell's smaller side
+const HANDLE_OFFSET = 0.3;
+
+let orViewInstanceCount = 0;
+
+function loadLayout() {
+    try {
+        const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
+        const rows = Math.min(MAX_GRID, Math.max(1, saved.rows | 0));
+        const cols = Math.min(MAX_GRID, Math.max(1, saved.cols | 0));
+        const cells = Array.from(
+            { length: rows * cols },
+            (_, i) => saved.cells?.[i] || null,
+        );
+        // Layouts saved before cells had colours get them now
+        cells.forEach((cell, i) => {
+            if (cell && !cell.color) {
+                cells[i] = { ...cell, color: pickCellColor(cells) };
+            }
+        });
+        return { rows, cols, cells };
+    } catch {
+        return { rows: 1, cols: 2, cells: [null, null] };
+    }
+}
+
+function toolGroupIdFor(engine) {
+    return `${engine.id}-tools`;
+}
+
+function viewportIdForCell(index) {
+    return `or-cell-${index}`;
+}
+
+const cross = (a, b) => [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0],
+];
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const add = (a, b, scale = 1) => a.map((v, i) => v + b[i] * scale);
+
+// Rotates a vector about a unit axis (Rodrigues' formula)
+function rotateAbout(vector, axis, angle) {
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    const axisCross = cross(axis, vector);
+    const axisDot = dot(axis, vector);
+    return vector.map(
+        (v, i) =>
+            v * cos + axisCross[i] * sin + axis[i] * axisDot * (1 - cos),
+    );
+}
+
+// Where the source viewport's image plane cuts through the target viewport:
+// the world-space line (a point centred in the target's view and a unit
+// direction) and the same line in the target's canvas coordinates.
+// Null when the two planes are parallel.
+function referenceLineGeometry(sourceCamera, targetViewport) {
+    const targetCamera = targetViewport.getCamera();
+    const n1 = sourceCamera.viewPlaneNormal;
+    const n2 = targetCamera.viewPlaneNormal;
+
+    const rawDirection = cross(n1, n2);
+    const lengthSquared = dot(rawDirection, rawDirection);
+    if (lengthSquared < 1e-6) return null;
+    const direction = rawDirection.map((v) => v / Math.sqrt(lengthSquared));
+
+    // A point lying on both planes
+    const d1 = dot(n1, sourceCamera.focalPoint);
+    const d2 = dot(n2, targetCamera.focalPoint);
+    const a = cross(n2, rawDirection);
+    const b = cross(rawDirection, n1);
+    const anyPoint = [0, 1, 2].map(
+        (i) => (d1 * a[i] + d2 * b[i]) / lengthSquared,
+    );
+
+    // Slide it along the line to the middle of what the target is showing
+    const { clientWidth, clientHeight } = targetViewport.element;
+    const viewCentre = targetViewport.canvasToWorld([
+        clientWidth / 2,
+        clientHeight / 2,
+    ]);
+    const point = add(
+        anyPoint,
+        direction,
+        dot(add(viewCentre, anyPoint, -1), direction),
+    );
+
+    const [x1, y1] = targetViewport.worldToCanvas(
+        add(point, direction, -REFERENCE_LINE_REACH),
+    );
+    const [x2, y2] = targetViewport.worldToCanvas(
+        add(point, direction, REFERENCE_LINE_REACH),
+    );
+    const [cx, cy] = targetViewport.worldToCanvas(point);
+    if (![x1, y1, x2, y2, cx, cy].every(Number.isFinite)) return null;
+
+    // Rotation handles sit either side of the middle of the line
+    const length = Math.hypot(x2 - x1, y2 - y1) || 1;
+    const reach = Math.min(clientWidth, clientHeight) * HANDLE_OFFSET;
+    const ux = ((x2 - x1) / length) * reach;
+    const uy = ((y2 - y1) / length) * reach;
+
+    return {
+        point,
+        direction,
+        canvas: { x1, y1, x2, y2 },
+        centre: [cx, cy],
+        handles: [
+            [cx - ux, cy - uy],
+            [cx + ux, cy + uy],
+        ],
+    };
+}
+
+export default function OrView({ onClose }) {
+    const [initialized, setInitialized] = useState(false);
+    const [error, setError] = useState("");
+    const [layout, setLayout] = useState(loadLayout);
+    const [engine, setEngine] = useState(null);
+    const [studies, setStudies] = useState(null);
+    const [studySeries, setStudySeries] = useState({});
+    const [readyCells, setReadyCells] = useState({});
+    const [activeCell, setActiveCell] = useState(0);
+    const [activeTool, setActiveTool] = useState(WindowLevelTool.toolName);
+    const [showReferenceLines, setShowReferenceLines] = useState(true);
+    const [referenceLines, setReferenceLines] = useState({});
+    const [cellSlabs, setCellSlabs] = useState({});
+
+    const seriesPromisesRef = useRef(new Map());
+    const volumePromisesRef = useRef(new Map());
+    const toolGroupRef = useRef(null);
+    const activeToolRef = useRef(activeTool);
+
+    const { rows, cols, cells } = layout;
+
+    // Initialize Cornerstone
+    useEffect(() => {
+        let isCancelled = false;
+
+        initializeCornerstone()
+            .then(() => {
+                if (!isCancelled) setInitialized(true);
+            })
+            .catch((err) => {
+                console.error("Failed to initialize Cornerstone:", err);
+                if (!isCancelled) setError("Failed to initialize viewer");
+            });
+
+        return () => {
+            isCancelled = true;
+        };
+    }, []);
+
+    // One rendering engine shared by every cell
+    useEffect(() => {
+        if (!initialized) return;
+
+        const renderingEngine = new RenderingEngine(
+            `orViewEngine-${++orViewInstanceCount}`,
+        );
+        const seriesPromises = seriesPromisesRef.current;
+        const volumePromises = volumePromisesRef.current;
+        setEngine(renderingEngine);
+
+        return () => {
+            setEngine(null);
+            setReadyCells({});
+            // Tools must go before the engine they render through
+            ToolGroupManager.destroyToolGroup(toolGroupIdFor(renderingEngine));
+            toolGroupRef.current = null;
+            renderingEngine.destroy();
+            seriesPromises.clear();
+            volumePromises.clear();
+            // Free the decoded slices and the raw DICOM files behind them
+            cache.purgeCache();
+            wadouri.dataSetCacheManager.purge();
+        };
+    }, [initialized]);
+
+    // Studies offered in each cell's picker
+    useEffect(() => {
+        let isCancelled = false;
+
+        pb.send("/api/visualizer/dicom/studies", NO_AUTO_CANCEL)
+            .then((data) => {
+                if (!isCancelled) setStudies(data);
+            })
+            .catch((err) => {
+                console.error("Failed to fetch studies:", err);
+                if (!isCancelled) {
+                    setError(err.message || "Failed to fetch studies");
+                }
+            });
+
+        return () => {
+            isCancelled = true;
+        };
+    }, []);
+
+    // Remember the grid between visits
+    useEffect(() => {
+        try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(layout));
+        } catch {
+            // Storage unavailable: the layout just won't be remembered
+        }
+    }, [layout]);
+
+    const loadStudySeries = useCallback(
+        async (studyId) => {
+            if (studySeries[studyId]) return;
+            try {
+                const data = await pb.send(
+                    `/api/visualizer/dicom/studies/${studyId}`,
+                    NO_AUTO_CANCEL,
+                );
+                setStudySeries((prev) => ({
+                    ...prev,
+                    [studyId]: data.series || [],
+                }));
+            } catch (err) {
+                console.error("Failed to fetch study:", err);
+            }
+        },
+        [studySeries],
+    );
+
+    // Series details (with image IDs), fetched once per series
+    const getSeries = useCallback((seriesId) => {
+        const promises = seriesPromisesRef.current;
+        if (!promises.has(seriesId)) {
+            const promise = pb
+                .send(`/api/visualizer/dicom/series/${seriesId}`, {
+                    method: "GET",
+                    ...NO_AUTO_CANCEL,
+                })
+                .then((data) => {
+                    const instances = [...(data.instances || [])].sort(
+                        (a, b) =>
+                            (a.instanceNumber || 0) - (b.instanceNumber || 0),
+                    );
+                    return {
+                        ...data,
+                        instances,
+                        imageIds: instances.map((i) => instanceImageId(i.id)),
+                    };
+                })
+                .catch((err) => {
+                    promises.delete(seriesId);
+                    throw err;
+                });
+            promises.set(seriesId, promise);
+        }
+        return promises.get(seriesId);
+    }, []);
+
+    // The volume for a series, built once and shared by all its MPR cells
+    const getVolume = useCallback((seriesId, imageIds, onProgress) => {
+        const promises = volumePromisesRef.current;
+        if (!promises.has(seriesId)) {
+            const promise = (async () => {
+                await loadImages(imageIds, onProgress, () => false);
+                const volumeId = `cornerstoneStreamingImageVolume:or-${seriesId}`;
+                const volume = await volumeLoader.createAndCacheVolume(
+                    volumeId,
+                    { imageIds },
+                );
+                volume.load();
+                return volumeId;
+            })().catch((err) => {
+                promises.delete(seriesId);
+                throw err;
+            });
+            promises.set(seriesId, promise);
+        }
+        return promises.get(seriesId);
+    }, []);
+
+    const handleCellReady = useCallback((index, info) => {
+        setReadyCells((prev) => {
+            const next = { ...prev };
+            if (info) {
+                next[index] = info;
+            } else {
+                delete next[index];
+            }
+            return next;
+        });
+    }, []);
+
+    const setCellSlab = useCallback((index, slab) => {
+        setCellSlabs((prev) => ({ ...prev, [index]: slab }));
+    }, []);
+
+    const setCellContent = (index, content) => {
+        // New content starts as a plain single slice
+        setCellSlabs((prev) => ({ ...prev, [index]: undefined }));
+        setLayout((prev) => {
+            const previous = prev.cells[index];
+            // A cell keeps its name and colour when its series is changed,
+            // and gets a fresh unused colour when it is first filled
+            const next = content && {
+                ...content,
+                name: previous?.name,
+                color: previous?.color || pickCellColor(prev.cells),
+            };
+            return {
+                ...prev,
+                cells: prev.cells.map((cell, i) => (i === index ? next : cell)),
+            };
+        });
+    };
+
+    // Changes a cell's name or line colour without reloading its series
+    const updateCell = useCallback((index, patch) => {
+        setLayout((prev) => ({
+            ...prev,
+            cells: prev.cells.map((cell, i) =>
+                i === index && cell ? { ...cell, ...patch } : cell,
+            ),
+        }));
+    }, []);
+
+    const resizeGrid = (nextRows, nextCols) => {
+        setLayout((prev) => ({
+            rows: nextRows,
+            cols: nextCols,
+            cells: Array.from(
+                { length: nextRows * nextCols },
+                (_, i) => prev.cells[i] || null,
+            ),
+        }));
+        setActiveCell((prev) => Math.min(prev, nextRows * nextCols - 1));
+    };
+
+    // One set of mouse tools shared by every loaded cell
+    useEffect(() => {
+        if (!engine) return;
+
+        const infos = Object.values(readyCells);
+        if (!infos.length) return;
+
+        const id = toolGroupIdFor(engine);
+        const toolGroup = ToolGroupManager.createToolGroup(id);
+        VIEWER_TOOLS.forEach(({ toolName }) => toolGroup.addTool(toolName));
+        infos.forEach((info) =>
+            toolGroup.addViewport(info.viewportId, engine.id),
+        );
+        toolGroupRef.current = toolGroup;
+        applyToolBindings(toolGroup, activeToolRef.current);
+
+        return () => {
+            toolGroupRef.current = null;
+            ToolGroupManager.destroyToolGroup(id);
+        };
+    }, [engine, readyCells]);
+
+    // Switch the tool on the left mouse button
+    useEffect(() => {
+        activeToolRef.current = activeTool;
+        if (toolGroupRef.current) {
+            applyToolBindings(toolGroupRef.current, activeTool);
+        }
+    }, [activeTool]);
+
+    // Section lines: where one cell's image plane cuts through the others.
+    // Drawn in every other cell that shares its frame of reference (i.e. the
+    // same study's coordinates). Every MPR cell's plane is always shown and
+    // is its own independent section, movable and turnable from its line;
+    // a stack cell's plane is shown only while that cell is active.
+    useEffect(() => {
+        if (!engine) return;
+
+        const compute = () => {
+            const lines = {};
+
+            if (showReferenceLines) {
+                const sections = Object.keys(readyCells)
+                    .map(Number)
+                    .filter((index) => readyCells[index].view !== "stack");
+                const sources = [...new Set([activeCell, ...sections])];
+
+                sources.forEach((sourceIndex) => {
+                    const source = readyCells[sourceIndex];
+                    if (!source?.frameOfReferenceUID) return;
+                    const sourceCamera = engine
+                        .getViewport(source.viewportId)
+                        ?.getCamera();
+                    if (!sourceCamera) return;
+
+                    Object.entries(readyCells).forEach(([index, target]) => {
+                        if (Number(index) === sourceIndex) return;
+                        if (
+                            target.frameOfReferenceUID !==
+                            source.frameOfReferenceUID
+                        ) {
+                            return;
+                        }
+                        const viewport = engine.getViewport(target.viewportId);
+                        if (!viewport) return;
+
+                        const line = referenceLineGeometry(
+                            sourceCamera,
+                            viewport,
+                        );
+                        if (line) {
+                            (lines[index] ||= []).push({
+                                ...line.canvas,
+                                key: sourceIndex,
+                                sourceIndex,
+                                // Only a volume's plane can be moved and
+                                // turned; a stack shows its images as stored
+                                handles: sections.includes(sourceIndex)
+                                    ? line.handles
+                                    : null,
+                                active: sourceIndex === activeCell,
+                                label: cellName(cells[sourceIndex], sourceIndex),
+                                color:
+                                    cells[sourceIndex]?.color || CELL_COLORS[0],
+                            });
+                        }
+                    });
+                });
+            }
+
+            setReferenceLines(lines);
+        };
+
+        let frame = 0;
+        const schedule = () => {
+            if (!frame) {
+                frame = requestAnimationFrame(() => {
+                    frame = 0;
+                    compute();
+                });
+            }
+        };
+
+        const elements = Object.values(readyCells).map((info) => info.element);
+        elements.forEach((element) =>
+            element.addEventListener(Enums.Events.CAMERA_MODIFIED, schedule),
+        );
+        window.addEventListener("resize", schedule);
+        schedule();
+
+        return () => {
+            cancelAnimationFrame(frame);
+            window.removeEventListener("resize", schedule);
+            elements.forEach((element) =>
+                element.removeEventListener(
+                    Enums.Events.CAMERA_MODIFIED,
+                    schedule,
+                ),
+            );
+        };
+    }, [engine, readyCells, activeCell, showReferenceLines, cells]);
+
+    // Dragging an MPR cell's section line in another cell. `from` and
+    // `to` are consecutive pointer positions on the target cell's canvas.
+    const dragReferenceLine = useCallback(
+        (sourceIndex, targetIndex, mode, from, to) => {
+            const source = readyCells[sourceIndex];
+            const target = readyCells[targetIndex];
+            if (!engine || !source || !target) return;
+
+            const sourceViewport = engine.getViewport(source.viewportId);
+            const targetViewport = engine.getViewport(target.viewportId);
+            if (!sourceViewport || !targetViewport) return;
+
+            const camera = sourceViewport.getCamera();
+            const line = referenceLineGeometry(camera, targetViewport);
+            if (!line) return;
+
+            if (mode === "move") {
+                // Shift the plane along its own normal by however far the
+                // pointer moved across it
+                const shift = dot(
+                    add(
+                        targetViewport.canvasToWorld(to),
+                        targetViewport.canvasToWorld(from),
+                        -1,
+                    ),
+                    camera.viewPlaneNormal,
+                );
+                sourceViewport.setCamera({
+                    focalPoint: add(
+                        camera.focalPoint,
+                        camera.viewPlaneNormal,
+                        shift,
+                    ),
+                    position: add(
+                        camera.position,
+                        camera.viewPlaneNormal,
+                        shift,
+                    ),
+                });
+            } else {
+                // Turn the plane about the target's line of sight, through
+                // the middle of the line, by the angle the pointer swept
+                const [cx, cy] = line.centre;
+                const sweep =
+                    Math.atan2(to[1] - cy, to[0] - cx) -
+                    Math.atan2(from[1] - cy, from[0] - cx);
+                const axis = targetViewport.getCamera().viewPlaneNormal;
+
+                // Which way round the axis matches the pointer depends on
+                // how the target is oriented, so try a small turn and see
+                const probe = targetViewport.worldToCanvas(
+                    add(line.point, rotateAbout(line.direction, axis, 0.01), 50),
+                );
+                const along = targetViewport.worldToCanvas(
+                    add(line.point, line.direction, 50),
+                );
+                const probeSweep =
+                    Math.atan2(probe[1] - cy, probe[0] - cx) -
+                    Math.atan2(along[1] - cy, along[0] - cx);
+                const angle = Math.sin(probeSweep) >= 0 ? sweep : -sweep;
+
+                const turn = (worldPoint) =>
+                    add(
+                        line.point,
+                        rotateAbout(
+                            add(worldPoint, line.point, -1),
+                            axis,
+                            angle,
+                        ),
+                    );
+                sourceViewport.setCamera({
+                    focalPoint: turn(camera.focalPoint),
+                    position: turn(camera.position),
+                    viewUp: rotateAbout(camera.viewUp, axis, angle),
+                });
+            }
+
+            sourceViewport.render();
+        },
+        [engine, readyCells],
+    );
+
+    const resetViews = () => {
+        if (!engine) return;
+        setCellSlabs({});
+        Object.values(readyCells).forEach((info) => {
+            const viewport = engine.getViewport(info.viewportId);
+            if (!viewport) return;
+            if (info.view !== "stack") {
+                viewport.setBlendMode(Enums.BlendModes.COMPOSITE);
+            }
+            viewport.resetProperties();
+            viewport.resetCamera();
+            viewport.render();
+        });
+    };
+
+    return (
+        <div style={pageStyle}>
+            <div style={toolbarStyle}>
+                <div style={toolbarGroupStyle}>
+                    {onClose && (
+                        <button onClick={onClose} style={btnStyle}>
+                            ← Studies
+                        </button>
+                    )}
+                    <strong style={{ alignSelf: "center" }}>OR View</strong>
+                </div>
+
+                <div style={toolbarGroupStyle}>
+                    {TOOLS.map((tool) => (
+                        <button
+                            key={tool.name}
+                            onClick={() => setActiveTool(tool.name)}
+                            style={
+                                activeTool === tool.name
+                                    ? activeBtnStyle
+                                    : btnStyle
+                            }
+                        >
+                            {tool.label}
+                        </button>
+                    ))}
+                </div>
+
+                <div style={toolbarGroupStyle}>
+                    <label style={fieldStyle}>
+                        Rows
+                        <select
+                            value={rows}
+                            onChange={(e) =>
+                                resizeGrid(Number(e.target.value), cols)
+                            }
+                            style={selectStyle}
+                        >
+                            {Array.from({ length: MAX_GRID }, (_, i) => (
+                                <option key={i + 1} value={i + 1}>
+                                    {i + 1}
+                                </option>
+                            ))}
+                        </select>
+                    </label>
+                    <label style={fieldStyle}>
+                        Columns
+                        <select
+                            value={cols}
+                            onChange={(e) =>
+                                resizeGrid(rows, Number(e.target.value))
+                            }
+                            style={selectStyle}
+                        >
+                            {Array.from({ length: MAX_GRID }, (_, i) => (
+                                <option key={i + 1} value={i + 1}>
+                                    {i + 1}
+                                </option>
+                            ))}
+                        </select>
+                    </label>
+                    <label style={fieldStyle}>
+                        <input
+                            type="checkbox"
+                            checked={showReferenceLines}
+                            onChange={(e) =>
+                                setShowReferenceLines(e.target.checked)
+                            }
+                        />
+                        Reference lines
+                    </label>
+                    <button onClick={resetViews} style={btnStyle}>
+                        Reset
+                    </button>
+                </div>
+            </div>
+
+            {error && <p style={{ color: "red", margin: "0.5rem" }}>{error}</p>}
+
+            <div
+                style={{
+                    ...gridStyle,
+                    gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
+                    gridTemplateRows: `repeat(${rows}, minmax(0, 1fr))`,
+                }}
+            >
+                {cells.map((content, index) => (
+                    <OrViewCell
+                        key={index}
+                        index={index}
+                        content={content}
+                        engine={engine}
+                        active={index === activeCell}
+                        referenceLines={referenceLines[index]}
+                        slab={cellSlabs[index] || DEFAULT_SLAB}
+                        onSlabChange={setCellSlab}
+                        onDragReferenceLine={dragReferenceLine}
+                        studies={studies}
+                        studySeries={studySeries}
+                        loadStudySeries={loadStudySeries}
+                        getSeries={getSeries}
+                        getVolume={getVolume}
+                        onActivate={setActiveCell}
+                        onReady={handleCellReady}
+                        onChange={setCellContent}
+                        onUpdate={updateCell}
+                    />
+                ))}
+            </div>
+        </div>
+    );
+}
+
+function OrViewCell({
+    index,
+    content,
+    engine,
+    active,
+    referenceLines,
+    slab,
+    studies,
+    studySeries,
+    loadStudySeries,
+    getSeries,
+    getVolume,
+    onActivate,
+    onReady,
+    onChange,
+    onUpdate,
+    onSlabChange,
+    onDragReferenceLine,
+}) {
+    const [status, setStatus] = useState("");
+    const [error, setError] = useState("");
+    const [info, setInfo] = useState({});
+    const [details, setDetails] = useState(null);
+    const [picking, setPicking] = useState(false);
+    const [settingsOpen, setSettingsOpen] = useState(false);
+
+    const elementRef = useRef(null);
+    const lineDragRef = useRef(null);
+
+    // Pointer position on this cell's canvas
+    const canvasPoint = (evt) => {
+        const rect = elementRef.current.getBoundingClientRect();
+        return [evt.clientX - rect.left, evt.clientY - rect.top];
+    };
+
+    const startLineDrag = (evt, line, mode) => {
+        evt.preventDefault();
+        evt.stopPropagation();
+        evt.currentTarget.setPointerCapture(evt.pointerId);
+        lineDragRef.current = {
+            sourceIndex: line.sourceIndex,
+            mode,
+            last: canvasPoint(evt),
+        };
+    };
+
+    const moveLineDrag = (evt) => {
+        const drag = lineDragRef.current;
+        if (!drag) return;
+
+        const point = canvasPoint(evt);
+        onDragReferenceLine(drag.sourceIndex, index, drag.mode, drag.last, point);
+        drag.last = point;
+    };
+
+    const endLineDrag = () => {
+        lineDragRef.current = null;
+    };
+
+    const seriesId = content?.seriesId;
+    const view = content?.view;
+
+    // Show the chosen series in this cell's viewport
+    useEffect(() => {
+        const element = elementRef.current;
+        if (!engine || !seriesId || !element) return;
+
+        let isCancelled = false;
+        const viewportId = viewportIdForCell(index);
+        const viewDef = VIEWS.find((v) => v.id === view) || VIEWS[0];
+        const isVolume = viewDef.id !== "stack";
+
+        engine.enableElement({
+            viewportId,
+            type: isVolume
+                ? Enums.ViewportType.ORTHOGRAPHIC
+                : Enums.ViewportType.STACK,
+            element,
+            defaultOptions: {
+                background: [0, 0, 0],
+                ...(isVolume ? { orientation: viewDef.orientation } : {}),
+            },
+        });
+        const viewport = engine.getViewport(viewportId);
+
+        const patchInfo = (patch) => setInfo((prev) => ({ ...prev, ...patch }));
+        const onStackImage = (evt) =>
+            patchInfo({ index: evt.detail.imageIdIndex });
+        const onVolumeImage = (evt) =>
+            patchInfo({
+                index: evt.detail.imageIndex,
+                count: evt.detail.numberOfSlices,
+            });
+        const onVoi = (evt) => {
+            const { lower, upper } = evt.detail.range;
+            patchInfo({
+                windowWidth: upper - lower,
+                windowCenter: (upper + lower) / 2,
+            });
+        };
+        const onContextMenu = (evt) => evt.preventDefault();
+        element.addEventListener(Enums.Events.STACK_NEW_IMAGE, onStackImage);
+        element.addEventListener(Enums.Events.VOLUME_NEW_IMAGE, onVolumeImage);
+        element.addEventListener(Enums.Events.VOI_MODIFIED, onVoi);
+        element.addEventListener("contextmenu", onContextMenu);
+
+        const resizeObserver = new ResizeObserver(() => {
+            if (!isCancelled) engine.resize(true, true);
+        });
+        resizeObserver.observe(element);
+
+        (async () => {
+            setError("");
+            setInfo({});
+            setDetails(null);
+            setStatus("Loading…");
+
+            const series = await getSeries(seriesId);
+            if (isCancelled) return;
+            setDetails(series);
+            if (!series.imageIds.length) throw new Error("Series has no images");
+
+            if (isVolume) {
+                const volumeId = await getVolume(
+                    seriesId,
+                    series.imageIds,
+                    (loaded) => {
+                        if (!isCancelled) {
+                            setStatus(
+                                `Loading slices ${loaded} / ${series.imageIds.length}`,
+                            );
+                        }
+                    },
+                );
+                if (isCancelled) return;
+                await viewport.setVolumes([{ volumeId }]);
+            } else {
+                await viewport.setStack(series.imageIds, 0);
+            }
+            if (isCancelled) return;
+            viewport.render();
+
+            const range = viewport.getProperties()?.voiRange;
+            patchInfo({
+                index: viewport.getSliceIndex(),
+                count: viewport.getNumberOfSlices(),
+                ...(range
+                    ? {
+                          windowWidth: range.upper - range.lower,
+                          windowCenter: (range.upper + range.lower) / 2,
+                      }
+                    : {}),
+            });
+            setStatus("");
+
+            onReady(index, {
+                viewportId,
+                element,
+                seriesId,
+                view: viewDef.id,
+                // Cells can only be cross-referenced inside one patient
+                // coordinate system
+                frameOfReferenceUID:
+                    metaData.get("imagePlaneModule", series.imageIds[0])
+                        ?.frameOfReferenceUID || null,
+            });
+        })().catch((err) => {
+            if (isCancelled) return;
+            console.error("Failed to load cell:", err);
+            setStatus("");
+            setError(err.message || "Failed to load series");
+        });
+
+        // Cleanup
+        return () => {
+            isCancelled = true;
+            resizeObserver.disconnect();
+            element.removeEventListener(
+                Enums.Events.STACK_NEW_IMAGE,
+                onStackImage,
+            );
+            element.removeEventListener(
+                Enums.Events.VOLUME_NEW_IMAGE,
+                onVolumeImage,
+            );
+            element.removeEventListener(Enums.Events.VOI_MODIFIED, onVoi);
+            element.removeEventListener("contextmenu", onContextMenu);
+            onReady(index, null);
+            // The engine is already gone when the whole page is closing
+            if (!engine.hasBeenDestroyed) {
+                // Detach from its tools first so none of them tries to draw
+                // on a viewport that no longer exists
+                ToolGroupManager.getToolGroupForViewport(
+                    viewportId,
+                    engine.id,
+                )?.removeViewports(engine.id, viewportId);
+                engine.disableElement(viewportId);
+            }
+        };
+    }, [engine, index, seriesId, view, getSeries, getVolume, onReady]);
+
+    const viewLabel = VIEWS.find((v) => v.id === view)?.label;
+    const isVolume = Boolean(view) && view !== "stack";
+    const sliceCount = info.count || 0;
+    // Window presets are in Hounsfield units, so greyscale CT only
+    const isCT =
+        details?.modality === "CT" &&
+        (details.instances[0]?.metadata?.samplesPerPixel ?? 1) === 1;
+
+    const getViewport = () => engine?.getViewport(viewportIdForCell(index));
+
+    const showSlice = (sliceIndex) => {
+        const element = elementRef.current;
+        if (!element || sliceIndex < 0 || sliceIndex >= sliceCount) return;
+
+        setInfo((prev) => ({ ...prev, index: sliceIndex }));
+        csUtils
+            .jumpToSlice(element, { imageIndex: sliceIndex })
+            .catch((err) => console.error("Failed to change slice:", err));
+    };
+
+    const changeSlab = (patch) => {
+        const viewport = getViewport();
+        if (!viewport) return;
+
+        const next = { ...slab, ...patch };
+        applySlabToViewport(viewport, next);
+        onSlabChange(index, next);
+    };
+
+    const changeWindow = (width, center) => {
+        const viewport = getViewport();
+        if (viewport) applyWindowToViewport(viewport, width, center);
+    };
+    const study = details?.study || {};
+    // Text overlays, one entry per line; empty values are skipped
+    const seriesLines = details
+        ? [
+              [
+                  details.seriesNumber && `Series ${details.seriesNumber}`,
+                  details.modality,
+                  details.bodyPartExamined,
+              ],
+              [details.protocolName],
+              [
+                  `${details.instances.length} images`,
+                  details.sliceThickness &&
+                      `${Number(Number(details.sliceThickness).toFixed(3))} mm thick`,
+              ],
+              [slabLabel(slab)],
+          ]
+        : [];
+    const studyLines = details
+        ? [
+              [study.patientName],
+              [study.patientID, study.patientSex],
+              [study.studyDescription],
+              [study.studyDate?.slice(0, 10)],
+              [study.institutionName],
+          ]
+        : [];
+    const renderLines = (lines) =>
+        lines
+            .map((parts) => parts.filter(Boolean).join(" · "))
+            .filter(Boolean)
+            .map((line, i) => <div key={i}>{line}</div>);
+    const showPicker = !content || picking;
+
+    return (
+        <div
+            data-or-cell={index}
+            style={{
+                ...cellStyle,
+                borderColor: active ? "#89b4fa" : "#313244",
+            }}
+            onPointerDownCapture={() => onActivate(index)}
+            onWheelCapture={() => onActivate(index)}
+        >
+            <div style={cellBodyStyle} data-viewport-body>
+                <div ref={elementRef} style={viewportStyle} />
+
+                {referenceLines?.length > 0 && (
+                    <svg style={lineOverlayStyle}>
+                        {referenceLines.map((line) => (
+                            <g key={line.key}>
+                                <line
+                                    x1={line.x1}
+                                    y1={line.y1}
+                                    x2={line.x2}
+                                    y2={line.y2}
+                                    stroke={line.color}
+                                    strokeWidth={line.active ? 2.5 : 1.25}
+                                />
+                                {line.handles && (
+                                    <>
+                                        {/* Wide invisible grip for moving the plane */}
+                                        <line
+                                            x1={line.x1}
+                                            y1={line.y1}
+                                            x2={line.x2}
+                                            y2={line.y2}
+                                            stroke="transparent"
+                                            strokeWidth="12"
+                                            style={lineGripStyle}
+                                            onPointerDown={(evt) =>
+                                                startLineDrag(evt, line, "move")
+                                            }
+                                            onPointerMove={moveLineDrag}
+                                            onPointerUp={endLineDrag}
+                                            onPointerCancel={endLineDrag}
+                                        />
+                                        {/* Which cell this section belongs to */}
+                                        <text
+                                            x={line.handles[0][0] + 9}
+                                            y={line.handles[0][1] - 8}
+                                            fill={line.color}
+                                            style={lineLabelStyle}
+                                        >
+                                            {line.label}
+                                        </text>
+                                        {line.handles.map(([x, y], i) => (
+                                            <circle
+                                                key={i}
+                                                cx={x}
+                                                cy={y}
+                                                r="5"
+                                                fill={line.color}
+                                                stroke="#000"
+                                                style={lineHandleStyle}
+                                                onPointerDown={(evt) =>
+                                                    startLineDrag(
+                                                        evt,
+                                                        line,
+                                                        "rotate",
+                                                    )
+                                                }
+                                                onPointerMove={moveLineDrag}
+                                                onPointerUp={endLineDrag}
+                                                onPointerCancel={endLineDrag}
+                                            />
+                                        ))}
+                                    </>
+                                )}
+                            </g>
+                        ))}
+                    </svg>
+                )}
+
+                {content && (
+                    <>
+                        <div
+                            style={{
+                                ...overlayStyle,
+                                top: 6,
+                                left: 8,
+                                color: content.color || overlayStyle.color,
+                            }}
+                        >
+                            {cellName(content, index)} · {content.label}
+                            {viewLabel ? ` · ${viewLabel}` : ""}
+                            <div style={detailLinesStyle}>
+                                {renderLines(seriesLines)}
+                            </div>
+                        </div>
+                        <div style={studyOverlayStyle}>
+                            {renderLines(studyLines)}
+                        </div>
+                        <div style={{ ...overlayStyle, bottom: 6, left: 8 }}>
+                            {info.count > 0 &&
+                                `Slice ${(info.index ?? 0) + 1} / ${info.count}`}
+                        </div>
+                        <div style={{ ...overlayStyle, bottom: 6, right: 8 }}>
+                            {info.windowWidth !== undefined &&
+                                `W ${Math.round(info.windowWidth)} / L ${Math.round(info.windowCenter)}`}
+                        </div>
+                        <div style={cellButtonsStyle}>
+                            <button
+                                onClick={() => setSettingsOpen((open) => !open)}
+                                style={
+                                    settingsOpen
+                                        ? smallActiveBtnStyle
+                                        : smallBtnStyle
+                                }
+                                aria-expanded={settingsOpen}
+                            >
+                                Settings
+                            </button>
+                            <button
+                                onClick={() => setPicking(true)}
+                                style={smallBtnStyle}
+                            >
+                                Change
+                            </button>
+                            <button
+                                onClick={() => onChange(index, null)}
+                                style={smallBtnStyle}
+                                aria-label={`Clear cell ${index + 1}`}
+                            >
+                                ✕
+                            </button>
+                        </div>
+                    </>
+                )}
+
+                {(status || error) && !showPicker && (
+                    <div style={statusStyle}>
+                        <span style={error ? { color: "#f38ba8" } : null}>
+                            {error || status}
+                        </span>
+                    </div>
+                )}
+
+                {showPicker && (
+                    <CellPicker
+                        index={index}
+                        content={content}
+                        studies={studies}
+                        studySeries={studySeries}
+                        loadStudySeries={loadStudySeries}
+                        onCancel={content ? () => setPicking(false) : null}
+                        onPick={(next) => {
+                            setPicking(false);
+                            onChange(index, next);
+                        }}
+                    />
+                )}
+            </div>
+
+            {content && settingsOpen && (
+                <div style={cellSettingsStyle}>
+                    <div style={sliderRowStyle}>
+                        <button
+                            onClick={() => showSlice((info.index ?? 0) - 1)}
+                            style={smallBtnStyle}
+                            disabled={(info.index ?? 0) <= 0}
+                            aria-label={`Previous slice in cell ${index + 1}`}
+                        >
+                            ‹
+                        </button>
+                        <input
+                            type="range"
+                            min="0"
+                            max={Math.max(0, sliceCount - 1)}
+                            value={info.index ?? 0}
+                            onChange={(e) => showSlice(parseInt(e.target.value))}
+                            disabled={sliceCount <= 1}
+                            style={{ flex: 1, minWidth: 0 }}
+                            aria-label={`Cell ${index + 1} slice`}
+                        />
+                        <button
+                            onClick={() => showSlice((info.index ?? 0) + 1)}
+                            style={smallBtnStyle}
+                            disabled={(info.index ?? 0) >= sliceCount - 1}
+                            aria-label={`Next slice in cell ${index + 1}`}
+                        >
+                            ›
+                        </button>
+                    </div>
+                    <div style={identityRowStyle}>
+                        <label style={identityFieldStyle}>
+                            Label
+                            <input
+                                type="text"
+                                value={content.name || ""}
+                                maxLength={MAX_NAME_LENGTH}
+                                placeholder={String(index + 1)}
+                                onChange={(e) =>
+                                    onUpdate(index, { name: e.target.value })
+                                }
+                                style={identityInputStyle}
+                                aria-label={`Cell ${index + 1} label`}
+                            />
+                        </label>
+                        <label style={identityFieldStyle}>
+                            Line colour
+                            <input
+                                type="color"
+                                value={content.color || CELL_COLORS[0]}
+                                onChange={(e) =>
+                                    onUpdate(index, { color: e.target.value })
+                                }
+                                style={colorInputStyle}
+                                aria-label={`Cell ${index + 1} line colour`}
+                            />
+                        </label>
+                    </div>
+                    <ViewportSettings
+                        label={`Cell ${index + 1}`}
+                        isVolume={isVolume}
+                        isCT={isCT}
+                        slab={slab}
+                        windowWidth={info.windowWidth}
+                        windowCenter={info.windowCenter}
+                        onSlabChange={changeSlab}
+                        onWindowChange={changeWindow}
+                    />
+                </div>
+            )}
+        </div>
+    );
+}
+
+function CellPicker({
+    index,
+    content,
+    studies,
+    studySeries,
+    loadStudySeries,
+    onCancel,
+    onPick,
+}) {
+    const [studyId, setStudyId] = useState(content?.studyId || "");
+    const [seriesId, setSeriesId] = useState(content?.seriesId || "");
+    const [view, setView] = useState(content?.view || "stack");
+
+    useEffect(() => {
+        if (studyId) loadStudySeries(studyId);
+    }, [studyId, loadStudySeries]);
+
+    const seriesList = studySeries[studyId];
+    const series = seriesList?.find((s) => s.id === seriesId);
+    // Only series that form a regular volume can be shown as MPR planes
+    const availableViews = VIEWS.filter(
+        (v) => v.id === "stack" || series?.is3DCapable,
+    );
+    const chosenView = availableViews.some((v) => v.id === view)
+        ? view
+        : "stack";
+
+    return (
+        <div style={pickerStyle} onDoubleClick={(e) => e.stopPropagation()}>
+            <strong>Cell {index + 1}</strong>
+
+            <select
+                value={studyId}
+                onChange={(e) => {
+                    setStudyId(e.target.value);
+                    setSeriesId("");
+                }}
+                style={pickerSelectStyle}
+                aria-label={`Cell ${index + 1} study`}
+            >
+                <option value="">
+                    {studies ? "Select study…" : "Loading studies…"}
+                </option>
+                {(studies || []).map((study) => (
+                    <option key={study.id} value={study.id}>
+                        {study.studyDescription || "No description"} —{" "}
+                        {study.patientName || "Unknown"} (
+                        {study.studyDate?.slice(0, 10) || "no date"})
+                    </option>
+                ))}
+            </select>
+
+            <select
+                value={seriesId}
+                onChange={(e) => setSeriesId(e.target.value)}
+                disabled={!seriesList}
+                style={pickerSelectStyle}
+                aria-label={`Cell ${index + 1} series`}
+            >
+                <option value="">
+                    {studyId && !seriesList
+                        ? "Loading series…"
+                        : "Select series…"}
+                </option>
+                {(seriesList || []).map((s) => (
+                    <option key={s.id} value={s.id}>
+                        {s.seriesNumber} · {s.seriesDescription || "No description"}{" "}
+                        ({s.instanceCount || 0} images
+                        {s.is3DCapable ? ", MPR" : ""})
+                    </option>
+                ))}
+            </select>
+
+            <select
+                value={chosenView}
+                onChange={(e) => setView(e.target.value)}
+                disabled={!series}
+                style={pickerSelectStyle}
+                aria-label={`Cell ${index + 1} view`}
+            >
+                {availableViews.map((v) => (
+                    <option key={v.id} value={v.id}>
+                        {v.label}
+                    </option>
+                ))}
+            </select>
+
+            <div style={{ display: "flex", gap: 8 }}>
+                <button
+                    onClick={() =>
+                        onPick({
+                            studyId,
+                            seriesId,
+                            view: chosenView,
+                            label:
+                                series.seriesDescription ||
+                                `Series ${series.seriesNumber}`,
+                        })
+                    }
+                    disabled={!series}
+                    style={activeBtnStyle}
+                >
+                    Load
+                </button>
+                {onCancel && (
+                    <button onClick={onCancel} style={btnStyle}>
+                        Cancel
+                    </button>
+                )}
+            </div>
+        </div>
+    );
+}
+
+const pageStyle = {
+    display: "flex",
+    flexDirection: "column",
+    height: "100vh",
+    fontFamily: "monospace",
+    background: "#11111b",
+    color: "#cdd6f4",
+};
+
+const toolbarStyle = {
+    display: "flex",
+    flexWrap: "wrap",
+    justifyContent: "space-between",
+    gap: "0.75rem",
+    padding: "0.5rem 0.75rem",
+    background: "#1e1e2e",
+    borderBottom: "1px solid #313244",
+};
+
+const toolbarGroupStyle = {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: "0.5rem",
+};
+
+const fieldStyle = {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    fontSize: "0.9em",
+};
+
+const gridStyle = {
+    flex: 1,
+    minHeight: 0,
+    display: "grid",
+    gap: 4,
+    padding: 4,
+};
+
+const cellStyle = {
+    display: "flex",
+    flexDirection: "column",
+    minWidth: 0,
+    minHeight: 0,
+    background: "#000",
+    border: "2px solid #313244",
+    borderRadius: 4,
+    overflow: "hidden",
+};
+
+// The image area of a cell; its settings panel (when open) sits below it
+const cellBodyStyle = {
+    position: "relative",
+    flex: 1,
+    minHeight: 0,
+};
+
+const cellSettingsStyle = {
+    background: "#181825",
+};
+
+const sliderRowStyle = {
+    display: "flex",
+    alignItems: "center",
+    gap: "0.4rem",
+    padding: "0.3rem 0.5rem",
+};
+
+const identityRowStyle = {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: "0.75rem",
+    padding: "0.3rem 0.5rem 0",
+    fontSize: "0.85em",
+};
+
+const identityFieldStyle = {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+};
+
+const identityInputStyle = {
+    width: 150,
+    padding: "2px 6px",
+    border: "1px solid #555",
+    borderRadius: 4,
+    background: "#313244",
+    color: "#cdd6f4",
+    fontFamily: "inherit",
+    fontSize: "inherit",
+};
+
+const colorInputStyle = {
+    width: 36,
+    height: 22,
+    padding: 0,
+    border: "1px solid #555",
+    borderRadius: 4,
+    background: "none",
+    cursor: "pointer",
+};
+
+const viewportStyle = {
+    position: "absolute",
+    inset: 0,
+};
+
+const lineOverlayStyle = {
+    position: "absolute",
+    inset: 0,
+    width: "100%",
+    height: "100%",
+    pointerEvents: "none",
+};
+
+// Parts of a reference line that take the pointer (the overlay itself lets
+// everything through to the viewport underneath)
+const lineGripStyle = {
+    pointerEvents: "stroke",
+    cursor: "move",
+};
+
+const lineLabelStyle = {
+    pointerEvents: "none",
+    fontSize: 12,
+    fontWeight: "bold",
+    paintOrder: "stroke",
+    stroke: "#000",
+    strokeWidth: 3,
+};
+
+const lineHandleStyle = {
+    pointerEvents: "all",
+    cursor: "grab",
+};
+
+const overlayStyle = {
+    position: "absolute",
+    pointerEvents: "none",
+    color: "#f9e2af",
+    fontSize: "0.85em",
+    textShadow: "0 0 3px #000",
+};
+
+// Secondary lines under a cell's title
+const detailLinesStyle = {
+    color: "#cdd6f4",
+    fontSize: "0.9em",
+};
+
+// Patient and study details, under the cell's buttons
+const studyOverlayStyle = {
+    ...overlayStyle,
+    top: 32,
+    right: 8,
+    maxWidth: "55%",
+    textAlign: "right",
+    color: "#cdd6f4",
+    fontSize: "0.75em",
+    overflowWrap: "anywhere",
+};
+
+const cellButtonsStyle = {
+    position: "absolute",
+    top: 4,
+    right: 4,
+    display: "flex",
+    gap: 4,
+};
+
+const statusStyle = {
+    position: "absolute",
+    inset: 0,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    background: "rgba(0, 0, 0, 0.6)",
+    pointerEvents: "none",
+};
+
+const pickerStyle = {
+    position: "absolute",
+    inset: 0,
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: "0.5rem",
+    padding: "0.75rem",
+    background: "rgba(17, 17, 27, 0.95)",
+};
+
+const selectStyle = {
+    padding: "4px 6px",
+    border: "1px solid #555",
+    borderRadius: 4,
+    background: "#313244",
+    color: "#cdd6f4",
+    fontFamily: "inherit",
+};
+
+const pickerSelectStyle = {
+    ...selectStyle,
+    width: "100%",
+    maxWidth: 420,
+};
+
+const btnStyle = {
+    padding: "6px 14px",
+    cursor: "pointer",
+    border: "1px solid #555",
+    borderRadius: 4,
+    background: "#313244",
+    color: "#cdd6f4",
+};
+
+const activeBtnStyle = {
+    ...btnStyle,
+    border: "1px solid #89b4fa",
+    background: "#89b4fa",
+    color: "#1e1e2e",
+    fontWeight: "bold",
+};
+
+const smallBtnStyle = {
+    ...btnStyle,
+    padding: "2px 8px",
+    fontSize: "0.85em",
+    opacity: 0.85,
+};
+
+const smallActiveBtnStyle = {
+    ...smallBtnStyle,
+    border: "1px solid #89b4fa",
+    background: "#89b4fa",
+    color: "#1e1e2e",
+    opacity: 1,
+};

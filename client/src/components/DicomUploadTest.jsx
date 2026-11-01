@@ -9,7 +9,7 @@ function formatSize(bytes) {
     return `${(bytes / 1e6).toFixed(1)} MB`;
 }
 
-export default function DicomUploadTest() {
+export default function DicomUploadTest({ onOpenOrView }) {
     const [loggedIn, setLoggedIn] = useState(pb.authStore.isValid);
     const [email, setEmail] = useState("");
     const [password, setPassword] = useState("");
@@ -228,7 +228,25 @@ export default function DicomUploadTest() {
                 padding: "0 1rem",
             }}
         >
-            <h1>DICOM Upload Test</h1>
+            <div
+                style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    gap: 8,
+                }}
+            >
+                <h1>DICOM Upload Test</h1>
+                {onOpenOrView && (
+                    <button
+                        style={viewBtnStyle}
+                        disabled={!loggedIn}
+                        onClick={onOpenOrView}
+                    >
+                        Open OR View
+                    </button>
+                )}
+            </div>
 
             {/* ── Auth ── */}
             <section style={{ marginBottom: "2rem" }}>

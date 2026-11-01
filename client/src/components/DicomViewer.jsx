@@ -3,7 +3,6 @@ import {
     RenderingEngine,
     Enums,
     cache,
-    imageLoader,
     volumeLoader,
     setVolumesForViewports,
     utilities as csUtils,
@@ -22,9 +21,22 @@ import {
     CrosshairsTool,
 } from "@cornerstonejs/tools";
 import { pb } from "@/lib/pb";
+import ViewportSettings from "./ViewportSettings";
+import {
+    PROJECTIONS,
+    DEFAULT_SLAB,
+    MIN_SLAB_THICKNESS,
+    slabLabel,
+    applySlabToViewport,
+    applyWindowToViewport,
+} from "@/lib/viewport-settings";
 import {
     initializeCornerstone,
     instanceImageId,
+    applyToolBindings,
+    addCrosshairsTool,
+    loadImages,
+    PLANE_COLORS,
     VIEWER_TOOLS,
 } from "@/lib/cornerstone";
 
@@ -37,27 +49,25 @@ const MPR_VIEWPORTS = [
         id: "axial",
         label: "Axial",
         orientation: Enums.OrientationAxis.AXIAL,
-        color: "rgb(240, 90, 90)",
+        color: PLANE_COLORS.axial,
     },
     {
         id: "sagittal",
         label: "Sagittal",
         orientation: Enums.OrientationAxis.SAGITTAL,
-        color: "rgb(240, 200, 60)",
+        color: PLANE_COLORS.sagittal,
     },
     {
         id: "coronal",
         label: "Coronal",
         orientation: Enums.OrientationAxis.CORONAL,
-        color: "rgb(90, 200, 110)",
+        color: PLANE_COLORS.coronal,
     },
 ];
 
 const CROSSHAIRS_CONFIG = {
     getReferenceLineColor: (viewportId) =>
         MPR_VIEWPORTS.find((vp) => vp.id === viewportId)?.color,
-    getReferenceLineControllable: () => true,
-    getReferenceLineDraggableRotatable: () => true,
     // Draws each plane's slab as a pair of lines either side of its reference
     // line, with handles to drag the thickness
     getReferenceLineSlabThicknessControlsOn: () => true,
@@ -76,71 +86,7 @@ const PRIMARY_TOOLS = [
     { name: CrosshairsTool.toolName, label: "Crosshairs", volumeOnly: true },
 ];
 
-// Bindings that stay active whichever tool is on the left button
-const FIXED_BINDINGS = {
-    [PanTool.toolName]: [{ mouseButton: MouseBindings.Auxiliary }],
-    [ZoomTool.toolName]: [{ mouseButton: MouseBindings.Secondary }],
-    [StackScrollTool.toolName]: [{ mouseButton: MouseBindings.Wheel }],
-};
-
-// How a viewport combines the slices inside its slab
-const PROJECTIONS = [
-    {
-        id: "none",
-        label: "Single slice",
-        short: "",
-        blendMode: Enums.BlendModes.COMPOSITE,
-    },
-    {
-        id: "mip",
-        label: "MIP (maximum)",
-        short: "MIP",
-        blendMode: Enums.BlendModes.MAXIMUM_INTENSITY_BLEND,
-    },
-    {
-        id: "minip",
-        label: "MinIP (minimum)",
-        short: "MinIP",
-        blendMode: Enums.BlendModes.MINIMUM_INTENSITY_BLEND,
-    },
-    {
-        id: "avg",
-        label: "Average",
-        short: "Avg",
-        blendMode: Enums.BlendModes.AVERAGE_INTENSITY_BLEND,
-    },
-];
-
-const DEFAULT_SLAB = { projection: "none", thickness: 10 };
-const MAX_SLAB_THICKNESS = 100;
-// Thinner than this the viewport is effectively showing a single slice
-const MIN_SLAB_THICKNESS = 0.5;
-
-const CT_PRESETS = [
-    { label: "Soft tissue", width: 400, center: 40 },
-    { label: "Bone", width: 1800, center: 400 },
-    { label: "Lung", width: 1500, center: -600 },
-    { label: "Brain", width: 80, center: 40 },
-];
-
-// Parallel slice downloads while building a volume
-const LOAD_CONCURRENCY = 6;
-
 let viewerInstanceCount = 0;
-
-function applyToolBindings(toolGroup, primaryToolName) {
-    VIEWER_TOOLS.forEach(({ toolName }) => {
-        const bindings = [...(FIXED_BINDINGS[toolName] || [])];
-        if (toolName === primaryToolName) {
-            bindings.push({ mouseButton: MouseBindings.Primary });
-        }
-
-        toolGroup.setToolPassive(toolName, { removeAllBindings: true });
-        if (bindings.length) {
-            toolGroup.setToolActive(toolName, { bindings });
-        }
-    });
-}
 
 // The projection a plane uses once its slab has thickness: the one chosen for
 // it, else the one it had before being dragged down to a single slice, else MIP
@@ -163,23 +109,6 @@ function applyCrosshairsMode(toolGroup, primaryToolName, visible) {
     } else {
         toolGroup.setToolDisabled(toolName);
     }
-}
-
-// Downloads every slice (a few at a time) so their metadata is available
-// before the volume is assembled
-async function loadImages(imageIds, onProgress, isCancelled) {
-    let next = 0;
-    let loaded = 0;
-
-    async function worker() {
-        while (next < imageIds.length && !isCancelled()) {
-            const imageId = imageIds[next++];
-            await imageLoader.loadAndCacheImage(imageId);
-            onProgress(++loaded);
-        }
-    }
-
-    await Promise.all(Array.from({ length: LOAD_CONCURRENCY }, worker));
 }
 
 function voiToWindow(range) {
@@ -480,13 +409,10 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
 
             // Crosshairs position themselves from the loaded volume, so the
             // tool can only join once the viewports are showing it
-            toolGroup.addTool(CrosshairsTool.toolName, CROSSHAIRS_CONFIG);
+            const crosshairs = addCrosshairsTool(toolGroup, CROSSHAIRS_CONFIG);
 
             // The tool switches a plane to MIP on every step of a slab handle
             // drag; apply the plane's own projection instead
-            const crosshairs = toolGroup.getToolInstance(
-                CrosshairsTool.toolName,
-            );
             crosshairs.setSlabThickness = (viewport, slabThickness) => {
                 const projectionId =
                     slabThickness < MIN_SLAB_THICKNESS
@@ -638,12 +564,7 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
     // Per-viewport window/level (follows to the other planes when linked)
     const applyWindow = (viewportId, width, center) => {
         const viewport = renderingEngineRef.current?.getViewport(viewportId);
-        if (!viewport || !(width > 0) || !Number.isFinite(center)) return;
-
-        viewport.setProperties({
-            voiRange: { lower: center - width / 2, upper: center + width / 2 },
-        });
-        viewport.render();
+        if (viewport) applyWindowToViewport(viewport, width, center);
     };
 
     // Per-viewport slab: how thick it is and how its slices are combined
@@ -657,15 +578,7 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
             ...patch,
             resumeProjection: undefined,
         };
-        const projection = PROJECTIONS.find((p) => p.id === slab.projection);
-
-        viewport.setBlendMode(projection.blendMode);
-        if (slab.projection === "none") {
-            viewport.resetSlabThickness();
-        } else {
-            viewport.setSlabThickness(slab.thickness);
-        }
-        viewport.render();
+        applySlabToViewport(viewport, slab);
 
         setSlabSettings((prev) => ({ ...prev, [viewportId]: slab }));
     };
@@ -846,9 +759,6 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
                     const hidden =
                         visibleLayout !== "all" && visibleLayout !== vp.id;
                     const slab = { ...DEFAULT_SLAB, ...slabSettings[vp.id] };
-                    const projection = PROJECTIONS.find(
-                        (p) => p.id === slab.projection,
-                    );
                     const settingsOpen = Boolean(openSettings[vp.id]);
 
                     return (
@@ -891,8 +801,7 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
                                 <div
                                     style={{ ...overlayStyle, top: 6, right: 8 }}
                                 >
-                                    {slab.projection !== "none" &&
-                                        `${projection.short} ${slab.thickness} mm`}
+                                    {slabLabel(slab)}
                                 </div>
                                 <div
                                     style={{
@@ -969,142 +878,20 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
                                 </button>
                             </div>
                             {settingsOpen && (
-                                <div
-                                    style={settingsStyle}
-                                    onDoubleClick={(e) => e.stopPropagation()}
-                                >
-                                    {isVolume && (
-                                        <div style={settingsRowStyle}>
-                                            <label style={fieldStyle}>
-                                                Projection
-                                                <select
-                                                    value={slab.projection}
-                                                    onChange={(e) =>
-                                                        applySlab(vp.id, {
-                                                            projection:
-                                                                e.target.value,
-                                                        })
-                                                    }
-                                                    style={fieldInputStyle}
-                                                >
-                                                    {PROJECTIONS.map((p) => (
-                                                        <option
-                                                            key={p.id}
-                                                            value={p.id}
-                                                        >
-                                                            {p.label}
-                                                        </option>
-                                                    ))}
-                                                </select>
-                                            </label>
-                                            <label
-                                                style={{
-                                                    ...fieldStyle,
-                                                    flex: 1,
-                                                    minWidth: 120,
-                                                }}
-                                            >
-                                                Thickness
-                                                <input
-                                                    type="range"
-                                                    min="1"
-                                                    max={MAX_SLAB_THICKNESS}
-                                                    step="1"
-                                                    value={slab.thickness}
-                                                    disabled={
-                                                        slab.projection ===
-                                                        "none"
-                                                    }
-                                                    onChange={(e) =>
-                                                        applySlab(vp.id, {
-                                                            thickness: Number(
-                                                                e.target.value,
-                                                            ),
-                                                        })
-                                                    }
-                                                    style={{
-                                                        flex: 1,
-                                                        minWidth: 0,
-                                                    }}
-                                                />
-                                                <span style={{ minWidth: 52 }}>
-                                                    {slab.projection === "none"
-                                                        ? "—"
-                                                        : `${slab.thickness} mm`}
-                                                </span>
-                                            </label>
-                                        </div>
-                                    )}
-                                    <div style={settingsRowStyle}>
-                                        {isCT && (
-                                            <label style={fieldStyle}>
-                                                Window
-                                                <select
-                                                    value=""
-                                                    onChange={(e) => {
-                                                        const preset =
-                                                            CT_PRESETS[
-                                                                e.target.value
-                                                            ];
-                                                        if (preset) {
-                                                            applyWindow(
-                                                                vp.id,
-                                                                preset.width,
-                                                                preset.center,
-                                                            );
-                                                        }
-                                                    }}
-                                                    style={fieldInputStyle}
-                                                >
-                                                    <option value="">
-                                                        Preset…
-                                                    </option>
-                                                    {CT_PRESETS.map(
-                                                        (preset, i) => (
-                                                            <option
-                                                                key={
-                                                                    preset.label
-                                                                }
-                                                                value={i}
-                                                            >
-                                                                {preset.label}
-                                                            </option>
-                                                        ),
-                                                    )}
-                                                </select>
-                                            </label>
-                                        )}
-                                        <label style={fieldStyle}>
-                                            W
-                                            <NumberField
-                                                label={`${vp.label} window width`}
-                                                value={info.windowWidth}
-                                                min={1}
-                                                onCommit={(width) =>
-                                                    applyWindow(
-                                                        vp.id,
-                                                        width,
-                                                        info.windowCenter,
-                                                    )
-                                                }
-                                            />
-                                        </label>
-                                        <label style={fieldStyle}>
-                                            L
-                                            <NumberField
-                                                label={`${vp.label} window level`}
-                                                value={info.windowCenter}
-                                                onCommit={(center) =>
-                                                    applyWindow(
-                                                        vp.id,
-                                                        info.windowWidth,
-                                                        center,
-                                                    )
-                                                }
-                                            />
-                                        </label>
-                                    </div>
-                                </div>
+                                <ViewportSettings
+                                    label={vp.label}
+                                    isVolume={isVolume}
+                                    isCT={isCT}
+                                    slab={slab}
+                                    windowWidth={info.windowWidth}
+                                    windowCenter={info.windowCenter}
+                                    onSlabChange={(patch) =>
+                                        applySlab(vp.id, patch)
+                                    }
+                                    onWindowChange={(width, center) =>
+                                        applyWindow(vp.id, width, center)
+                                    }
+                                />
                             )}
                         </div>
                     );
@@ -1122,7 +909,7 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
                 Left drag: selected tool · Wheel: scroll slices · Middle drag:
                 pan · Right drag: zoom
                 {isVolume &&
-                    " · Double-click a view to enlarge it · Drag a reference line to move that plane, or its end handles to rotate it · A plane with a slab shows its thickness as two outer lines, which can be dragged by their handles"}
+                    " · Double-click a view to enlarge it · Drag a reference line to move that plane, or an end handle to rotate that plane on its own · A plane with a slab shows its thickness as two outer lines, which can be dragged by their handles"}
             </p>
 
             <div style={infoStyle}>
@@ -1199,35 +986,6 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
                 />
             </div>
         </div>
-    );
-}
-
-// Number input that only applies its value on Enter or when leaving the field,
-// so half-typed numbers are never sent to the viewport
-function NumberField({ label, value, min, onCommit }) {
-    const [draft, setDraft] = useState(null);
-
-    const commit = () => {
-        if (draft === null) return;
-        const number = parseFloat(draft);
-        setDraft(null);
-        if (Number.isNaN(number)) return;
-        if (min !== undefined && number < min) return;
-        onCommit(number);
-    };
-
-    return (
-        <input
-            type="number"
-            aria-label={label}
-            value={draft ?? (value === undefined ? "" : Math.round(value))}
-            onChange={(e) => setDraft(e.target.value)}
-            onBlur={commit}
-            onKeyDown={(e) => {
-                if (e.key === "Enter") commit();
-            }}
-            style={{ ...fieldInputStyle, width: 72 }}
-        />
     );
 }
 
@@ -1421,37 +1179,4 @@ const smallBtnStyle = {
 const smallActiveBtnStyle = {
     ...activeBtnStyle,
     padding: "2px 10px",
-};
-
-const settingsStyle = {
-    display: "flex",
-    flexDirection: "column",
-    gap: "0.4rem",
-    padding: "0.5rem",
-    background: "#181825",
-    borderTop: "1px solid #313244",
-    fontSize: "0.85em",
-};
-
-const settingsRowStyle = {
-    display: "flex",
-    flexWrap: "wrap",
-    alignItems: "center",
-    gap: "0.75rem",
-};
-
-const fieldStyle = {
-    display: "flex",
-    alignItems: "center",
-    gap: 6,
-};
-
-const fieldInputStyle = {
-    padding: "2px 6px",
-    border: "1px solid #555",
-    borderRadius: 4,
-    background: "#313244",
-    color: "#cdd6f4",
-    fontFamily: "inherit",
-    fontSize: "inherit",
 };

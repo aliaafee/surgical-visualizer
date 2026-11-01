@@ -1,8 +1,9 @@
-import { init as csRenderInit } from "@cornerstonejs/core";
+import { init as csRenderInit, imageLoader } from "@cornerstonejs/core";
 import { init as dicomImageLoaderInit } from "@cornerstonejs/dicom-image-loader";
 import {
     init as csToolsInit,
     addTool,
+    Enums as csToolsEnums,
     WindowLevelTool,
     PanTool,
     ZoomTool,
@@ -20,6 +21,57 @@ export const VIEWER_TOOLS = [
     PlanarRotateTool,
     StackScrollTool,
 ];
+
+const { MouseBindings } = csToolsEnums;
+
+// Colour of each anatomical plane: its label, and its line in other views
+export const PLANE_COLORS = {
+    axial: "rgb(240, 90, 90)",
+    sagittal: "rgb(240, 200, 60)",
+    coronal: "rgb(90, 200, 110)",
+};
+
+// Bindings that stay active whichever tool is on the left button
+const FIXED_BINDINGS = {
+    [PanTool.toolName]: [{ mouseButton: MouseBindings.Auxiliary }],
+    [ZoomTool.toolName]: [{ mouseButton: MouseBindings.Secondary }],
+    [StackScrollTool.toolName]: [{ mouseButton: MouseBindings.Wheel }],
+};
+
+// Puts the given tool on the left mouse button, keeping the fixed bindings
+export function applyToolBindings(toolGroup, primaryToolName) {
+    VIEWER_TOOLS.forEach(({ toolName }) => {
+        const bindings = [...(FIXED_BINDINGS[toolName] || [])];
+        if (toolName === primaryToolName) {
+            bindings.push({ mouseButton: MouseBindings.Primary });
+        }
+
+        toolGroup.setToolPassive(toolName, { removeAllBindings: true });
+        if (bindings.length) {
+            toolGroup.setToolActive(toolName, { bindings });
+        }
+    });
+}
+
+// Parallel slice downloads while building a volume
+const LOAD_CONCURRENCY = 6;
+
+// Downloads every slice (a few at a time) so their metadata is available
+// before the volume is assembled
+export async function loadImages(imageIds, onProgress, isCancelled) {
+    let next = 0;
+    let loaded = 0;
+
+    async function worker() {
+        while (next < imageIds.length && !isCancelled()) {
+            const imageId = imageIds[next++];
+            await imageLoader.loadAndCacheImage(imageId);
+            onProgress(++loaded);
+        }
+    }
+
+    await Promise.all(Array.from({ length: LOAD_CONCURRENCY }, worker));
+}
 
 let initPromise = null;
 
@@ -61,4 +113,69 @@ export function instanceImageId(instanceId) {
     return `wadouri:${pb.buildURL(
         `/api/visualizer/dicom/instances/${instanceId}/file`,
     )}`;
+}
+
+// Adds the crosshairs tool to a tool group, with every reference line
+// draggable and each one rotatable on its own.
+//
+// Out of the box the tool turns all the other planes together when any
+// rotation handle is dragged, which keeps the lines locked at right angles.
+// Here only the plane whose line was grabbed is allowed to turn.
+export function addCrosshairsTool(toolGroup, configuration) {
+    let rotatingViewportId = null;
+
+    toolGroup.addTool(CrosshairsTool.toolName, {
+        ...configuration,
+        getReferenceLineControllable: () => true,
+        getReferenceLineDraggableRotatable: (viewportId) =>
+            rotatingViewportId === null || viewportId === rotatingViewportId,
+    });
+
+    const crosshairs = toolGroup.getToolInstance(CrosshairsTool.toolName);
+    const findRotationHandle =
+        crosshairs._getRotationHandleNearImagePoint.bind(crosshairs);
+
+    // The choice of plane is fixed for the length of a drag, even if the
+    // pointer strays off the handle while turning it
+    let isDragging = false;
+    const activateModify = crosshairs._activateModify;
+    const deactivateModify = crosshairs._deactivateModify;
+    crosshairs._activateModify = (element) => {
+        isDragging = true;
+        activateModify(element);
+    };
+    crosshairs._deactivateModify = (element) => {
+        isDragging = false;
+        deactivateModify(element);
+    };
+
+    // Runs on every hover and mouse down, so it always reflects the handle
+    // under the pointer: remember which plane that handle belongs to
+    crosshairs._getRotationHandleNearImagePoint = (
+        viewport,
+        annotation,
+        canvasCoords,
+        proximity,
+    ) => {
+        // Every line's handle can be picked up until a drag begins
+        if (!isDragging) rotatingViewportId = null;
+
+        const point = findRotationHandle(
+            viewport,
+            annotation,
+            canvasCoords,
+            proximity,
+        );
+        if (isDragging) return point;
+
+        if (point) {
+            const handle = annotation.data.handles.rotationPoints.find(
+                ([handlePoint]) => handlePoint === point,
+            );
+            rotatingViewportId = handle?.[1]?.id ?? null;
+        }
+        return point;
+    };
+
+    return crosshairs;
 }
