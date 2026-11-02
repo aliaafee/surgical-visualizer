@@ -158,8 +158,15 @@ function rotateAbout(vector, axis, angle) {
 // Where the source viewport's image plane cuts through the target viewport:
 // the world-space line (a point centred in the target's view and a unit
 // direction) and the same line in the target's canvas coordinates.
-// Null when the two planes are parallel.
-function referenceLineGeometry(sourceCamera, targetViewport) {
+// Null when the two planes are parallel. Given a thickness (mm), also the
+// lines where the faces of the source's slice meet the target, either side.
+// The line's middle is the nearest point on it to `centreOn` when given.
+function referenceLineGeometry(
+    sourceCamera,
+    targetViewport,
+    thickness = 0,
+    centreOn = null,
+) {
     const targetCamera = targetViewport.getCamera();
     const n1 = sourceCamera.viewPlaneNormal;
     const n2 = targetCamera.viewPlaneNormal;
@@ -178,26 +185,47 @@ function referenceLineGeometry(sourceCamera, targetViewport) {
         (i) => (d1 * a[i] + d2 * b[i]) / lengthSquared,
     );
 
-    // Slide it along the line to the middle of what the target is showing
+    // Slide it along the line to the nearest place to `centreOn`, or else to
+    // the middle of what the target is showing
     const { clientWidth, clientHeight } = targetViewport.element;
-    const viewCentre = targetViewport.canvasToWorld([
-        clientWidth / 2,
-        clientHeight / 2,
-    ]);
-    const point = add(
+    const anchor =
+        centreOn ||
+        targetViewport.canvasToWorld([clientWidth / 2, clientHeight / 2]);
+    const nearest = add(
         anyPoint,
         direction,
-        dot(add(viewCentre, anyPoint, -1), direction),
+        dot(add(anchor, anyPoint, -1), direction),
     );
 
     const [x1, y1] = targetViewport.worldToCanvas(
-        add(point, direction, -REFERENCE_LINE_REACH),
+        add(nearest, direction, -REFERENCE_LINE_REACH),
     );
     const [x2, y2] = targetViewport.worldToCanvas(
-        add(point, direction, REFERENCE_LINE_REACH),
+        add(nearest, direction, REFERENCE_LINE_REACH),
     );
+    if (![x1, y1, x2, y2].every(Number.isFinite)) return null;
+
+    // Without an anchor, the line's middle is the middle of the part of it
+    // inside the cell. `u` runs from -1 at (x1, y1) to 1 at (x2, y2).
+    let middle = 0;
+    if (!centreOn) {
+        let low = -1;
+        let high = 1;
+        [
+            [(x2 - x1) / 2, (x1 + x2) / 2, clientWidth],
+            [(y2 - y1) / 2, (y1 + y2) / 2, clientHeight],
+        ].forEach(([step, start, size]) => {
+            if (Math.abs(step) < 1e-9) return;
+            const a = (0 - start) / step;
+            const b = (size - start) / step;
+            low = Math.max(low, Math.min(a, b));
+            high = Math.min(high, Math.max(a, b));
+        });
+        if (low < high) middle = (low + high) / 2;
+    }
+    const point = add(nearest, direction, middle * REFERENCE_LINE_REACH);
     const [cx, cy] = targetViewport.worldToCanvas(point);
-    if (![x1, y1, x2, y2, cx, cy].every(Number.isFinite)) return null;
+    if (![cx, cy].every(Number.isFinite)) return null;
 
     // Rotation handles sit either side of the middle of the line
     const length = Math.hypot(x2 - x1, y2 - y1) || 1;
@@ -205,10 +233,35 @@ function referenceLineGeometry(sourceCamera, targetViewport) {
     const ux = ((x2 - x1) / length) * reach;
     const uy = ((y2 - y1) / length) * reach;
 
+    // A face sits half the thickness along the source's normal. Within the
+    // target's plane that is a step along the part of the source normal
+    // lying in it, scaled so the step covers the full offset.
+    let faces = null;
+    if (thickness > 0) {
+        const inPlane = add(n1, n2, -dot(n1, n2));
+        faces = [-1, 1]
+            .map((side) => {
+                const shift = add(
+                    point,
+                    inPlane,
+                    (side * thickness) / 2 / lengthSquared,
+                );
+                const [fx1, fy1] = targetViewport.worldToCanvas(
+                    add(shift, direction, -REFERENCE_LINE_REACH),
+                );
+                const [fx2, fy2] = targetViewport.worldToCanvas(
+                    add(shift, direction, REFERENCE_LINE_REACH),
+                );
+                return { x1: fx1, y1: fy1, x2: fx2, y2: fy2 };
+            })
+            .filter((face) => Object.values(face).every(Number.isFinite));
+    }
+
     return {
         point,
         direction,
         canvas: { x1, y1, x2, y2 },
+        faces,
         centre: [cx, cy],
         handles: [
             [cx - ux, cy - uy],
@@ -228,6 +281,7 @@ export default function OrView({ onClose }) {
     const [activeCell, setActiveCell] = useState(0);
     const [activeTool, setActiveTool] = useState(WindowLevelTool.toolName);
     const [showReferenceLines, setShowReferenceLines] = useState(true);
+    const [showSliceThickness, setShowSliceThickness] = useState(true);
     const [referenceLines, setReferenceLines] = useState({});
     const [cellSlabs, setCellSlabs] = useState({});
 
@@ -493,6 +547,17 @@ export default function OrView({ onClose }) {
                         ?.getCamera();
                     if (!sourceCamera) return;
 
+                    // A slab's thickness when the cell has one, otherwise
+                    // the thickness its slices were acquired at
+                    const slab = cellSlabs[sourceIndex];
+                    const thickness = !showSliceThickness
+                        ? 0
+                        : source.view !== "stack" &&
+                            slab &&
+                            slab.projection !== "none"
+                          ? slab.thickness
+                          : Number(source.sliceThickness) || 0;
+
                     Object.entries(readyCells).forEach(([index, target]) => {
                         if (Number(index) === sourceIndex) return;
                         if (
@@ -507,10 +572,12 @@ export default function OrView({ onClose }) {
                         const line = referenceLineGeometry(
                             sourceCamera,
                             viewport,
+                            thickness,
                         );
                         if (line) {
                             (lines[index] ||= []).push({
                                 ...line.canvas,
+                                faces: line.faces,
                                 key: sourceIndex,
                                 sourceIndex,
                                 // Only a volume's plane can be moved and
@@ -558,12 +625,23 @@ export default function OrView({ onClose }) {
                 ),
             );
         };
-    }, [engine, readyCells, activeCell, showReferenceLines, cells]);
+    }, [
+        engine,
+        readyCells,
+        activeCell,
+        showReferenceLines,
+        showSliceThickness,
+        cellSlabs,
+        cells,
+    ]);
 
     // Dragging an MPR cell's section line in another cell. `from` and
     // `to` are consecutive pointer positions on the target cell's canvas.
+    // `drag` lasts for the whole drag and keeps the turning point on it, so
+    // the plane turns about one fixed point rather than one that slides
+    // along the line as it turns.
     const dragReferenceLine = useCallback(
-        (sourceIndex, targetIndex, mode, from, to) => {
+        (sourceIndex, targetIndex, mode, from, to, drag) => {
             const source = readyCells[sourceIndex];
             const target = readyCells[targetIndex];
             if (!engine || !source || !target) return;
@@ -573,8 +651,14 @@ export default function OrView({ onClose }) {
             if (!sourceViewport || !targetViewport) return;
 
             const camera = sourceViewport.getCamera();
-            const line = referenceLineGeometry(camera, targetViewport);
+            const line = referenceLineGeometry(
+                camera,
+                targetViewport,
+                0,
+                drag.pivot,
+            );
             if (!line) return;
+            drag.pivot ||= line.point;
 
             if (mode === "move") {
                 // Shift the plane along its own normal by however far the
@@ -728,6 +812,17 @@ export default function OrView({ onClose }) {
                         />
                         Reference lines
                     </label>
+                    <label style={fieldStyle}>
+                        <input
+                            type="checkbox"
+                            checked={showSliceThickness}
+                            disabled={!showReferenceLines}
+                            onChange={(e) =>
+                                setShowSliceThickness(e.target.checked)
+                            }
+                        />
+                        Slice thickness
+                    </label>
                     <button onClick={resetViews} style={btnStyle}>
                         Reset
                     </button>
@@ -821,7 +916,14 @@ function OrViewCell({
         if (!drag) return;
 
         const point = canvasPoint(evt);
-        onDragReferenceLine(drag.sourceIndex, index, drag.mode, drag.last, point);
+        onDragReferenceLine(
+            drag.sourceIndex,
+            index,
+            drag.mode,
+            drag.last,
+            point,
+            drag,
+        );
         drag.last = point;
     };
 
@@ -930,6 +1032,7 @@ function OrViewCell({
                 element,
                 seriesId,
                 view: viewDef.id,
+                sliceThickness: series.sliceThickness,
                 // Cells can only be cross-referenced inside one patient
                 // coordinate system
                 frameOfReferenceUID:
@@ -1055,6 +1158,16 @@ function OrViewCell({
                     <svg style={lineOverlayStyle}>
                         {referenceLines.map((line) => (
                             <g key={line.key}>
+                                {line.faces?.map((face, i) => (
+                                    <line
+                                        key={i}
+                                        {...face}
+                                        stroke={line.color}
+                                        strokeWidth="1"
+                                        strokeDasharray="4 4"
+                                        opacity="0.8"
+                                    />
+                                ))}
                                 <line
                                     x1={line.x1}
                                     y1={line.y1}
