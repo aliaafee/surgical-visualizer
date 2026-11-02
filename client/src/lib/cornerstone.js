@@ -73,6 +73,13 @@ export async function loadImages(imageIds, onProgress, isCancelled) {
     await Promise.all(Array.from({ length: LOAD_CONCURRENCY }, worker));
 }
 
+// Volume (MPR) viewports need WebGL; without it Cornerstone falls back to CPU
+// rendering, which only draws stacks
+export const MPR_UNAVAILABLE_MESSAGE =
+    "MPR needs WebGL, which this browser has not made available. " +
+    "Turn on hardware acceleration in the browser settings and reload, " +
+    "or view the series as a stack.";
+
 let initPromise = null;
 
 export function initializeCornerstone() {

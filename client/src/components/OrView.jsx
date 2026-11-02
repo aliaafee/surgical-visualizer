@@ -6,6 +6,7 @@ import {
     metaData,
     volumeLoader,
     utilities as csUtils,
+    getShouldUseCPURendering,
 } from "@cornerstonejs/core";
 import { wadouri } from "@cornerstonejs/dicom-image-loader";
 import {
@@ -28,6 +29,7 @@ import {
     instanceImageId,
     applyToolBindings,
     loadImages,
+    MPR_UNAVAILABLE_MESSAGE,
     VIEWER_TOOLS,
 } from "@/lib/cornerstone";
 
@@ -185,16 +187,16 @@ function referenceLineGeometry(
         (i) => (d1 * a[i] + d2 * b[i]) / lengthSquared,
     );
 
-    // Slide it along the line to the nearest place to `centreOn`, or else to
-    // the middle of what the target is showing
+    // Slide it along the line to the middle of what the target is showing
     const { clientWidth, clientHeight } = targetViewport.element;
-    const anchor =
-        centreOn ||
-        targetViewport.canvasToWorld([clientWidth / 2, clientHeight / 2]);
+    const viewCentre = targetViewport.canvasToWorld([
+        clientWidth / 2,
+        clientHeight / 2,
+    ]);
     const nearest = add(
         anyPoint,
         direction,
-        dot(add(anchor, anyPoint, -1), direction),
+        dot(add(viewCentre, anyPoint, -1), direction),
     );
 
     const [x1, y1] = targetViewport.worldToCanvas(
@@ -205,23 +207,28 @@ function referenceLineGeometry(
     );
     if (![x1, y1, x2, y2].every(Number.isFinite)) return null;
 
-    // Without an anchor, the line's middle is the middle of the part of it
-    // inside the cell. `u` runs from -1 at (x1, y1) to 1 at (x2, y2).
-    let middle = 0;
-    if (!centreOn) {
-        let low = -1;
-        let high = 1;
-        [
-            [(x2 - x1) / 2, (x1 + x2) / 2, clientWidth],
-            [(y2 - y1) / 2, (y1 + y2) / 2, clientHeight],
-        ].forEach(([step, start, size]) => {
-            if (Math.abs(step) < 1e-9) return;
-            const a = (0 - start) / step;
-            const b = (size - start) / step;
-            low = Math.max(low, Math.min(a, b));
-            high = Math.min(high, Math.max(a, b));
-        });
-        if (low < high) middle = (low + high) / 2;
+    // The part of the line inside the cell, as `u` from -1 at (x1, y1) to
+    // 1 at (x2, y2)
+    let low = -1;
+    let high = 1;
+    [
+        [(x2 - x1) / 2, (x1 + x2) / 2, clientWidth],
+        [(y2 - y1) / 2, (y1 + y2) / 2, clientHeight],
+    ].forEach(([step, start, size]) => {
+        if (Math.abs(step) < 1e-9) return;
+        const a = (0 - start) / step;
+        const b = (size - start) / step;
+        low = Math.max(low, Math.min(a, b));
+        high = Math.min(high, Math.max(a, b));
+    });
+
+    // The line's middle is the place on it nearest `centreOn` while that is
+    // inside the cell, otherwise the middle of the part inside the cell
+    let middle = low < high ? (low + high) / 2 : 0;
+    if (centreOn) {
+        const u =
+            dot(add(centreOn, nearest, -1), direction) / REFERENCE_LINE_REACH;
+        if (u >= low && u <= high) middle = u;
     }
     const point = add(nearest, direction, middle * REFERENCE_LINE_REACH);
     const [cx, cy] = targetViewport.worldToCanvas(point);
@@ -270,6 +277,18 @@ function referenceLineGeometry(
     };
 }
 
+// A cell's stored line centre, brought onto its plane as it is now (the
+// plane may have moved along its normal since the centre was set)
+function lineCentreOn(centre, camera) {
+    if (!centre) return null;
+    const { viewPlaneNormal, focalPoint } = camera;
+    return add(
+        centre,
+        viewPlaneNormal,
+        -dot(add(centre, focalPoint, -1), viewPlaneNormal),
+    );
+}
+
 export default function OrView({ onClose }) {
     const [initialized, setInitialized] = useState(false);
     const [error, setError] = useState("");
@@ -284,6 +303,9 @@ export default function OrView({ onClose }) {
     const [showSliceThickness, setShowSliceThickness] = useState(true);
     const [referenceLines, setReferenceLines] = useState({});
     const [cellSlabs, setCellSlabs] = useState({});
+    // Per MPR cell, the world point its section lines are centred on and
+    // turn about, once one has been set by dragging or turning a line
+    const [lineCentres, setLineCentres] = useState({});
 
     const seriesPromisesRef = useRef(new Map());
     const volumePromisesRef = useRef(new Map());
@@ -454,6 +476,7 @@ export default function OrView({ onClose }) {
     const setCellContent = (index, content) => {
         // New content starts as a plain single slice
         setCellSlabs((prev) => ({ ...prev, [index]: undefined }));
+        setLineCentres((prev) => ({ ...prev, [index]: undefined }));
         setLayout((prev) => {
             const previous = prev.cells[index];
             // A cell keeps its name and colour when its series is changed,
@@ -573,6 +596,7 @@ export default function OrView({ onClose }) {
                             sourceCamera,
                             viewport,
                             thickness,
+                            lineCentreOn(lineCentres[sourceIndex], sourceCamera),
                         );
                         if (line) {
                             (lines[index] ||= []).push({
@@ -585,6 +609,7 @@ export default function OrView({ onClose }) {
                                 handles: sections.includes(sourceIndex)
                                     ? line.handles
                                     : null,
+                                centre: line.centre,
                                 active: sourceIndex === activeCell,
                                 label: cellName(cells[sourceIndex], sourceIndex),
                                 color:
@@ -612,12 +637,17 @@ export default function OrView({ onClose }) {
         elements.forEach((element) =>
             element.addEventListener(Enums.Events.CAMERA_MODIFIED, schedule),
         );
-        window.addEventListener("resize", schedule);
+        // Any cell changing size moves the lines drawn in it. Each cell
+        // resizes its viewport from its own observer in the same round as
+        // this one, and `schedule` waits a frame, so the lines are worked
+        // out against the resized viewports.
+        const resizeObserver = new ResizeObserver(schedule);
+        elements.forEach((element) => resizeObserver.observe(element));
         schedule();
 
         return () => {
             cancelAnimationFrame(frame);
-            window.removeEventListener("resize", schedule);
+            resizeObserver.disconnect();
             elements.forEach((element) =>
                 element.removeEventListener(
                     Enums.Events.CAMERA_MODIFIED,
@@ -632,6 +662,7 @@ export default function OrView({ onClose }) {
         showReferenceLines,
         showSliceThickness,
         cellSlabs,
+        lineCentres,
         cells,
     ]);
 
@@ -655,12 +686,52 @@ export default function OrView({ onClose }) {
                 camera,
                 targetViewport,
                 0,
-                drag.pivot,
+                (mode === "rotate" && drag.pivot) ||
+                    lineCentreOn(lineCentres[sourceIndex], camera),
             );
             if (!line) return;
-            drag.pivot ||= line.point;
 
-            if (mode === "move") {
+            if (mode === "rotate" && !drag.pivot) {
+                // Turning fixes the line's middle where it is, so it stays
+                // put once the line has turned
+                drag.pivot = line.point;
+                setLineCentres((prev) => ({
+                    ...prev,
+                    [sourceIndex]: line.point,
+                }));
+            }
+
+            if (mode === "centre") {
+                // Carry the middle of the line with the pointer: across the
+                // line moves the plane, along it slides the middle
+                const delta = add(
+                    targetViewport.canvasToWorld(to),
+                    targetViewport.canvasToWorld(from),
+                    -1,
+                );
+                const shift = dot(delta, camera.viewPlaneNormal);
+                sourceViewport.setCamera({
+                    focalPoint: add(
+                        camera.focalPoint,
+                        camera.viewPlaneNormal,
+                        shift,
+                    ),
+                    position: add(
+                        camera.position,
+                        camera.viewPlaneNormal,
+                        shift,
+                    ),
+                });
+                // From the latest centre, in case moves arrive faster than
+                // renders
+                setLineCentres((prev) => ({
+                    ...prev,
+                    [sourceIndex]: add(
+                        lineCentreOn(prev[sourceIndex], camera) || line.point,
+                        delta,
+                    ),
+                }));
+            } else if (mode === "move") {
                 // Shift the plane along its own normal by however far the
                 // pointer moved across it
                 const shift = dot(
@@ -723,12 +794,13 @@ export default function OrView({ onClose }) {
 
             sourceViewport.render();
         },
-        [engine, readyCells],
+        [engine, readyCells, lineCentres],
     );
 
     const resetViews = () => {
         if (!engine) return;
         setCellSlabs({});
+        setLineCentres({});
         Object.values(readyCells).forEach((info) => {
             const viewport = engine.getViewport(info.viewportId);
             if (!viewport) return;
@@ -943,6 +1015,12 @@ function OrViewCell({
         const viewportId = viewportIdForCell(index);
         const viewDef = VIEWS.find((v) => v.id === view) || VIEWS[0];
         const isVolume = viewDef.id !== "stack";
+
+        if (isVolume && getShouldUseCPURendering()) {
+            setStatus("");
+            setError(MPR_UNAVAILABLE_MESSAGE);
+            return;
+        }
 
         engine.enableElement({
             viewportId,
@@ -1189,6 +1267,35 @@ function OrViewCell({
                                             style={lineGripStyle}
                                             onPointerDown={(evt) =>
                                                 startLineDrag(evt, line, "move")
+                                            }
+                                            onPointerMove={moveLineDrag}
+                                            onPointerUp={endLineDrag}
+                                            onPointerCancel={endLineDrag}
+                                        />
+                                        {/* The line's middle, which it turns
+                                            about; drag it anywhere */}
+                                        <circle
+                                            cx={line.centre[0]}
+                                            cy={line.centre[1]}
+                                            r="6"
+                                            fill="none"
+                                            stroke={line.color}
+                                            strokeWidth="2"
+                                        />
+                                        <circle
+                                            cx={line.centre[0]}
+                                            cy={line.centre[1]}
+                                            r="1.5"
+                                            fill={line.color}
+                                        />
+                                        <circle
+                                            cx={line.centre[0]}
+                                            cy={line.centre[1]}
+                                            r="9"
+                                            fill="transparent"
+                                            style={lineCentreStyle}
+                                            onPointerDown={(evt) =>
+                                                startLineDrag(evt, line, "centre")
                                             }
                                             onPointerMove={moveLineDrag}
                                             onPointerUp={endLineDrag}
@@ -1637,6 +1744,11 @@ const lineLabelStyle = {
 const lineHandleStyle = {
     pointerEvents: "all",
     cursor: "grab",
+};
+
+const lineCentreStyle = {
+    pointerEvents: "all",
+    cursor: "move",
 };
 
 const overlayStyle = {

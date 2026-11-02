@@ -6,6 +6,7 @@ import {
     volumeLoader,
     setVolumesForViewports,
     utilities as csUtils,
+    getShouldUseCPURendering,
 } from "@cornerstonejs/core";
 import { wadouri } from "@cornerstonejs/dicom-image-loader";
 import {
@@ -36,6 +37,7 @@ import {
     applyToolBindings,
     addCrosshairsTool,
     loadImages,
+    MPR_UNAVAILABLE_MESSAGE,
     PLANE_COLORS,
     VIEWER_TOOLS,
 } from "@/lib/cornerstone";
@@ -247,6 +249,11 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
             (vp) => elementRefs.current[vp.id],
         );
         if (elements.some((el) => !el)) return;
+
+        if (isVolume && getShouldUseCPURendering()) {
+            setError(MPR_UNAVAILABLE_MESSAGE);
+            return;
+        }
 
         let isCancelled = false;
         const instanceNumber = ++viewerInstanceCount;
