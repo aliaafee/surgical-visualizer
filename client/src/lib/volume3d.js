@@ -2,7 +2,6 @@
 // tools for a 3D view, outlines of the slice planes drawn in it, cutting the
 // volume along one of those planes, and the crop box.
 
-import { cache } from "@cornerstonejs/core";
 import {
     Enums as csToolsEnums,
     PanTool,
@@ -153,15 +152,6 @@ export function createVolume3DToolGroup(toolGroupId) {
         bindings: [{ mouseButton: MouseBindings.Secondary }],
     });
     return toolGroup;
-}
-
-// The crop tools pair a 3D view with the planes beside it by the series
-// UID on the volume's image data, which Cornerstone leaves unset. Left that
-// way every crop box on the page would follow every other, so each volume
-// is tagged with its own series.
-export function tagVolumeSeries(volumeId, seriesId) {
-    const imageData = cache.getVolume(volumeId)?.imageData;
-    if (imageData) imageData.seriesInstanceUID = seriesId;
 }
 
 // Turns the crop box in `viewport` (the 3D view of `toolGroup`) on or off.

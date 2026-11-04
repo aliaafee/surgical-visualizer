@@ -51,7 +51,6 @@ import {
     setVolumeCut,
     showVolume3D,
     syncPlaneOutlines,
-    tagVolumeSeries,
     volume3DLabel,
     volume3DPresetsFor,
 } from "@/lib/volume3d";
@@ -471,7 +470,6 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
                 imageIds,
             });
             if (isCancelled) return;
-            tagVolumeSeries(volumeId, seriesData.id);
             volume.load();
 
             await setVolumesForViewports(

@@ -40,7 +40,6 @@ import {
     setVolumeCut,
     showVolume3D,
     syncPlaneOutlines,
-    tagVolumeSeries,
     volume3DLabel,
     volume3DPresetsFor,
 } from "@/lib/volume3d";
@@ -597,7 +596,6 @@ function OrPatientView({ patientId, onChangePatient, onClose }) {
                     volumeId,
                     { imageIds },
                 );
-                tagVolumeSeries(volumeId, seriesId);
                 volume.load();
                 return volumeId;
             })().catch((err) => {
