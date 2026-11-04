@@ -31,10 +31,19 @@ import {
     loadImages,
     MPR_UNAVAILABLE_MESSAGE,
     VIEWER_TOOLS,
-    createVolume3DToolGroup,
-    showVolume3D,
-    volume3DPresetsFor,
 } from "@/lib/cornerstone";
+import {
+    applyVolumePreset,
+    createVolume3DToolGroup,
+    opacityShiftRange,
+    setVolume3DCropping,
+    setVolumeCut,
+    showVolume3D,
+    syncPlaneOutlines,
+    tagVolumeSeries,
+    volume3DLabel,
+    volume3DPresetsFor,
+} from "@/lib/volume3d";
 import { fetchPatients, patientLabel } from "@/lib/patients";
 import PatientPicker from "./PatientPicker";
 
@@ -152,6 +161,11 @@ function loadLayout(patientId) {
 
 function toolGroupIdFor(engine) {
     return `${engine.id}-tools`;
+}
+
+// The tool group of the 3D cell at `index`
+function toolGroup3DIdFor(engine, index) {
+    return `${engine.id}-3d-${index}`;
 }
 
 function viewportIdForCell(index) {
@@ -493,6 +507,25 @@ function OrPatientView({ patientId, onChangePatient, onClose }) {
     // the cells until it is known which studies those are
     const ownStudyIds = studies && new Set(studies.map((study) => study.id));
 
+    // The MPR cells a 3D cell can be cut along: those in its study's
+    // coordinates
+    const cutOptionsFor = (index) => {
+        const target = readyCells[index];
+        if (target?.view !== VOLUME_3D_VIEW) return [];
+        return Object.entries(readyCells)
+            .filter(
+                ([, source]) =>
+                    isPlaneView(source.view) &&
+                    source.frameOfReferenceUID === target.frameOfReferenceUID,
+            )
+            .map(([sourceIndex, source]) => ({
+                id: sourceIndex,
+                label: `${cellName(cells[sourceIndex], Number(sourceIndex))} · ${
+                    VIEWS.find((v) => v.id === source.view)?.label
+                }`,
+            }));
+    };
+
     // Remember the grid between visits
     useEffect(() => {
         try {
@@ -564,6 +597,7 @@ function OrPatientView({ patientId, onChangePatient, onClose }) {
                     volumeId,
                     { imageIds },
                 );
+                tagVolumeSeries(volumeId, seriesId);
                 volume.load();
                 return volumeId;
             })().catch((err) => {
@@ -633,37 +667,29 @@ function OrPatientView({ patientId, onChangePatient, onClose }) {
         setActiveCell((prev) => Math.min(prev, nextRows * nextCols - 1));
     };
 
-    // One set of mouse tools shared by every loaded slice cell, and another
-    // (turn, pan, zoom) shared by the 3D cells
+    // One set of mouse tools shared by every loaded slice cell. Each 3D cell
+    // has a group of its own (made by the cell), since the crop box tool
+    // only works on the first viewport of its group.
     useEffect(() => {
         if (!engine) return;
 
-        const infos = Object.values(readyCells);
-        const sliceInfos = infos.filter((info) => info.view !== VOLUME_3D_VIEW);
-        const volumeInfos = infos.filter((info) => info.view === VOLUME_3D_VIEW);
+        const sliceInfos = Object.values(readyCells).filter(
+            (info) => info.view !== VOLUME_3D_VIEW,
+        );
+        if (!sliceInfos.length) return;
 
         const id = toolGroupIdFor(engine);
-        const id3D = `${id}-3d`;
-        if (sliceInfos.length) {
-            const toolGroup = ToolGroupManager.createToolGroup(id);
-            VIEWER_TOOLS.forEach(({ toolName }) => toolGroup.addTool(toolName));
-            sliceInfos.forEach((info) =>
-                toolGroup.addViewport(info.viewportId, engine.id),
-            );
-            toolGroupRef.current = toolGroup;
-            applyToolBindings(toolGroup, activeToolRef.current);
-        }
-        if (volumeInfos.length) {
-            const toolGroup3D = createVolume3DToolGroup(id3D);
-            volumeInfos.forEach((info) =>
-                toolGroup3D.addViewport(info.viewportId, engine.id),
-            );
-        }
+        const toolGroup = ToolGroupManager.createToolGroup(id);
+        VIEWER_TOOLS.forEach(({ toolName }) => toolGroup.addTool(toolName));
+        sliceInfos.forEach((info) =>
+            toolGroup.addViewport(info.viewportId, engine.id),
+        );
+        toolGroupRef.current = toolGroup;
+        applyToolBindings(toolGroup, activeToolRef.current);
 
         return () => {
             toolGroupRef.current = null;
             ToolGroupManager.destroyToolGroup(id);
-            ToolGroupManager.destroyToolGroup(id3D);
         };
     }, [engine, readyCells]);
 
@@ -755,6 +781,53 @@ function OrPatientView({ patientId, onChangePatient, onClose }) {
             }
 
             setReferenceLines(lines);
+            sync3DCells();
+        };
+
+        // Each 3D cell shows the planes of the MPR cells in its study as
+        // outlines (with the reference lines), and may be cut along one of
+        // them
+        const sync3DCells = () => {
+            Object.entries(readyCells).forEach(([index, target]) => {
+                if (target.view !== VOLUME_3D_VIEW) return;
+                const viewport3D = engine.getViewport(target.viewportId);
+                if (!viewport3D?.getDefaultActor?.()) return;
+
+                const planes = [];
+                const cameras = {};
+                Object.entries(readyCells).forEach(([sourceIndex, source]) => {
+                    if (!isPlaneView(source.view)) return;
+                    if (source.frameOfReferenceUID !== target.frameOfReferenceUID) {
+                        return;
+                    }
+                    const camera = engine.getViewport(source.viewportId)?.getCamera();
+                    if (!camera) return;
+                    cameras[sourceIndex] = camera;
+                    planes.push({
+                        key: sourceIndex,
+                        origin: camera.focalPoint,
+                        normal: camera.viewPlaneNormal,
+                        color: cells[sourceIndex]?.color || CELL_COLORS[0],
+                    });
+                });
+                syncPlaneOutlines(viewport3D, showReferenceLines ? planes : []);
+
+                // The crop box owns the volume's clipping while it is on
+                const content = cells[index];
+                if (!content?.crop) {
+                    const camera = content?.cut != null && cameras[content.cut];
+                    setVolumeCut(
+                        viewport3D,
+                        camera && {
+                            origin: camera.focalPoint,
+                            normal: camera.viewPlaneNormal.map((v) =>
+                                content.cutFlip ? -v : v,
+                            ),
+                        },
+                    );
+                }
+                viewport3D.render();
+            });
         };
 
         let frame = 0;
@@ -1071,6 +1144,7 @@ function OrPatientView({ patientId, onChangePatient, onClose }) {
                         slab={cellSlabs[index] || DEFAULT_SLAB}
                         onSlabChange={setCellSlab}
                         onDragReferenceLine={dragReferenceLine}
+                        cutOptions={cutOptionsFor(index)}
                         studies={studies}
                         studySeries={studySeries}
                         loadStudySeries={loadStudySeries}
@@ -1105,6 +1179,7 @@ function OrViewCell({
     onUpdate,
     onSlabChange,
     onDragReferenceLine,
+    cutOptions,
 }) {
     const [status, setStatus] = useState("");
     const [error, setError] = useState("");
@@ -1112,12 +1187,17 @@ function OrViewCell({
     const [details, setDetails] = useState(null);
     const [picking, setPicking] = useState(false);
     const [settingsOpen, setSettingsOpen] = useState(false);
+    // Whether a 3D cell's volume is showing yet
+    const [volume3DReady, setVolume3DReady] = useState(false);
 
     const elementRef = useRef(null);
     const lineDragRef = useRef(null);
-    // The 3D preset chosen for this cell, read when its volume is first
-    // rendered without that load waiting on it
-    const preset3DRef = useRef(content?.preset || null);
+    // The 3D preset and opacity shift chosen for this cell, read when its
+    // volume is first rendered without that load waiting on them
+    const look3DRef = useRef({
+        preset: content?.preset || null,
+        shift: content?.shift || 0,
+    });
 
     // Pointer position on this cell's canvas
     const canvasPoint = (evt) => {
@@ -1190,6 +1270,15 @@ function OrViewCell({
         });
         const viewport = engine.getViewport(viewportId);
 
+        // A 3D cell has its own tools: turn, pan, zoom and the crop box
+        const toolGroup3DId = toolGroup3DIdFor(engine, index);
+        if (is3D) {
+            createVolume3DToolGroup(toolGroup3DId).addViewport(
+                viewportId,
+                engine.id,
+            );
+        }
+
         const patchInfo = (patch) => setInfo((prev) => ({ ...prev, ...patch }));
         const onStackImage = (evt) =>
             patchInfo({ index: evt.detail.imageIdIndex });
@@ -1220,6 +1309,7 @@ function OrViewCell({
             setError("");
             setInfo({});
             setDetails(null);
+            setVolume3DReady(false);
             setStatus("Loading…");
 
             const series = await getSeries(seriesId);
@@ -1245,9 +1335,12 @@ function OrViewCell({
                     await showVolume3D(
                         viewport,
                         volumeId,
-                        preset3DRef.current ||
+                        look3DRef.current.preset ||
                             volume3DPresetsFor(series.modality)[0].id,
+                        look3DRef.current.shift,
                     );
+                    if (isCancelled) return;
+                    setVolume3DReady(true);
                 } else {
                     await viewport.setVolumes([{ volumeId }]);
                 }
@@ -1311,30 +1404,56 @@ function OrViewCell({
             if (!engine.hasBeenDestroyed) {
                 // Detach from its tools first so none of them tries to draw
                 // on a viewport that no longer exists
-                ToolGroupManager.getToolGroupForViewport(
-                    viewportId,
-                    engine.id,
-                )?.removeViewports(engine.id, viewportId);
+                if (is3D) {
+                    ToolGroupManager.destroyToolGroup(toolGroup3DId);
+                } else {
+                    ToolGroupManager.getToolGroupForViewport(
+                        viewportId,
+                        engine.id,
+                    )?.removeViewports(engine.id, viewportId);
+                }
                 engine.disableElement(viewportId);
+            } else if (is3D) {
+                ToolGroupManager.destroyToolGroup(toolGroup3DId);
             }
         };
     }, [engine, index, seriesId, view, getSeries, getVolume, onReady]);
 
-    // A 3D cell's rendering preset: the one chosen for it (kept with the
-    // cell's layout), else the first for the series' modality
+    // A 3D cell's settings, kept with the cell in the layout: its rendering
+    // preset (else the first for the series' modality), opacity shift,
+    // crop box, and the plane it is cut along
     const presets3D = volume3DPresetsFor(details?.modality);
-    const preset3D = content?.preset || presets3D[0].id;
+    const settings3D = {
+        preset: content?.preset || presets3D[0].id,
+        shift: content?.shift || 0,
+        crop: Boolean(content?.crop),
+        cut: content?.cut ?? null,
+        cutFlip: Boolean(content?.cutFlip),
+    };
+    const shiftRange3D = opacityShiftRange(details?.modality);
+    const { preset: preset3D, shift: shift3D, crop: crop3D } = settings3D;
 
-    // Recolour the volume whenever another preset is chosen; until the
-    // volume is in the viewport there is nothing to recolour
+    // Recolour the volume whenever another preset or shift is chosen
     useEffect(() => {
-        preset3DRef.current = content?.preset || null;
-        if (view !== VOLUME_3D_VIEW || !details) return;
+        look3DRef.current = { preset: content?.preset || null, shift: shift3D };
+        if (!volume3DReady) return;
         const viewport = engine?.getViewport(viewportIdForCell(index));
-        if (!viewport?.getDefaultActor?.()) return;
-        viewport.setProperties({ preset: preset3D });
+        if (viewport) applyVolumePreset(viewport, preset3D, shift3D);
+    }, [engine, index, volume3DReady, content?.preset, preset3D, shift3D]);
+
+    // The crop box in the 3D view. Turning it off frees the volume's
+    // clipping for a cut again, which the OR view puts back on its next
+    // update.
+    useEffect(() => {
+        if (!volume3DReady || !engine) return;
+        const toolGroup = ToolGroupManager.getToolGroup(
+            toolGroup3DIdFor(engine, index),
+        );
+        const viewport = engine.getViewport(viewportIdForCell(index));
+        if (!toolGroup || !viewport) return;
+        setVolume3DCropping(toolGroup, viewport, crop3D);
         viewport.render();
-    }, [engine, index, view, details, content?.preset, preset3D]);
+    }, [engine, index, volume3DReady, crop3D]);
 
     const viewLabel = VIEWS.find((v) => v.id === view)?.label;
     const isVolume = Boolean(view) && view !== "stack";
@@ -1389,7 +1508,12 @@ function OrViewCell({
               ],
               [
                   is3D
-                      ? presets3D.find((p) => p.id === preset3D)?.label
+                      ? volume3DLabel(
+                            presets3D,
+                            settings3D,
+                            shiftRange3D,
+                            cutOptions,
+                        )
                       : slabLabel(slab),
               ],
           ]
@@ -1674,10 +1798,10 @@ function OrViewCell({
                         <Volume3DSettings
                             label={`Cell ${index + 1}`}
                             presets={presets3D}
-                            preset={preset3D}
-                            onPresetChange={(preset) =>
-                                onUpdate(index, { preset })
-                            }
+                            shiftRange={shiftRange3D}
+                            cutOptions={cutOptions}
+                            settings={settings3D}
+                            onChange={(patch) => onUpdate(index, patch)}
                         />
                     ) : (
                         <ViewportSettings

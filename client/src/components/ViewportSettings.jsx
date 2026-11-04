@@ -106,9 +106,26 @@ export default function ViewportSettings({
     );
 }
 
-// Controls for a 3D (volume-rendered) viewport: which transfer function
-// colours the volume. `presets` are { id, label } for the series' modality.
-export function Volume3DSettings({ label, presets, preset, onPresetChange }) {
+// Controls for a 3D (volume-rendered) viewport. `settings` holds
+//   preset   which transfer function colours the volume
+//   shift    how far its opacity ramp is moved (volume units)
+//   crop     whether the crop box is on
+//   cut      id of the plane the volume is cut along, or null
+//   cutFlip  whether the cut keeps the other side
+// and `onChange(patch)` changes some of them. `presets` and `cutOptions`
+// are { id, label }; `shiftRange` is { max, step, unit }. The crop box and a
+// cut can't both be on, so turning one on turns the other off.
+export function Volume3DSettings({
+    label,
+    presets,
+    shiftRange,
+    cutOptions,
+    settings,
+    onChange,
+}) {
+    const { preset, shift, crop, cut, cutFlip } = settings;
+    const unit = shiftRange.unit ? ` ${shiftRange.unit}` : "";
+
     return (
         <div style={settingsStyle} onDoubleClick={(e) => e.stopPropagation()}>
             <div style={settingsRowStyle}>
@@ -116,7 +133,7 @@ export function Volume3DSettings({ label, presets, preset, onPresetChange }) {
                     Rendering
                     <select
                         value={preset}
-                        onChange={(e) => onPresetChange(e.target.value)}
+                        onChange={(e) => onChange({ preset: e.target.value })}
                         style={fieldInputStyle}
                         aria-label={`${label} rendering preset`}
                     >
@@ -127,7 +144,92 @@ export function Volume3DSettings({ label, presets, preset, onPresetChange }) {
                         ))}
                     </select>
                 </label>
+                <label style={{ ...fieldStyle, flex: 1, minWidth: 160 }}>
+                    Opacity shift
+                    <input
+                        type="range"
+                        min={-shiftRange.max}
+                        max={shiftRange.max}
+                        step={shiftRange.step}
+                        value={shift}
+                        onChange={(e) =>
+                            onChange({ shift: Number(e.target.value) })
+                        }
+                        style={{ flex: 1, minWidth: 0 }}
+                        aria-label={`${label} opacity shift`}
+                    />
+                    <span style={{ minWidth: 64 }}>
+                        {shift > 0 ? "+" : ""}
+                        {shift}
+                        {unit}
+                    </span>
+                    <button
+                        type="button"
+                        onClick={() => onChange({ shift: 0 })}
+                        disabled={!shift}
+                        style={fieldInputStyle}
+                    >
+                        0
+                    </button>
+                </label>
             </div>
+            <div style={settingsRowStyle}>
+                <label style={fieldStyle}>
+                    <input
+                        type="checkbox"
+                        checked={crop}
+                        onChange={(e) =>
+                            onChange(
+                                e.target.checked
+                                    ? { crop: true, cut: null }
+                                    : { crop: false },
+                            )
+                        }
+                    />
+                    Crop box
+                </label>
+                <label style={fieldStyle}>
+                    Cut along
+                    <select
+                        value={cut ?? ""}
+                        onChange={(e) =>
+                            onChange(
+                                e.target.value
+                                    ? { cut: e.target.value, crop: false }
+                                    : { cut: null },
+                            )
+                        }
+                        disabled={!cutOptions.length}
+                        style={fieldInputStyle}
+                        aria-label={`${label} cut along plane`}
+                    >
+                        <option value="">
+                            {cutOptions.length ? "No cut" : "No planes to cut along"}
+                        </option>
+                        {cutOptions.map((option) => (
+                            <option key={option.id} value={option.id}>
+                                {option.label}
+                            </option>
+                        ))}
+                    </select>
+                </label>
+                <label style={fieldStyle}>
+                    <input
+                        type="checkbox"
+                        checked={cutFlip}
+                        disabled={!cut}
+                        onChange={(e) => onChange({ cutFlip: e.target.checked })}
+                    />
+                    Keep other side
+                </label>
+            </div>
+            {(crop || cut) && (
+                <p style={noteStyle}>
+                    {crop
+                        ? "Drag a sphere to move that side or corner of the box; drag elsewhere to turn the volume, or with Shift to turn the box."
+                        : "The cut follows the plane as it moves. The crop box and a cut can't be on together."}
+                </p>
+            )}
         </div>
     );
 }
@@ -182,6 +284,11 @@ const fieldStyle = {
     display: "flex",
     alignItems: "center",
     gap: 6,
+};
+
+const noteStyle = {
+    margin: 0,
+    color: "#a6adc8",
 };
 
 const fieldInputStyle = {

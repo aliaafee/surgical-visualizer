@@ -40,10 +40,21 @@ import {
     MPR_UNAVAILABLE_MESSAGE,
     PLANE_COLORS,
     VIEWER_TOOLS,
-    createVolume3DToolGroup,
-    showVolume3D,
-    volume3DPresetsFor,
 } from "@/lib/cornerstone";
+import {
+    addCropControlTool,
+    applyVolumePreset,
+    createVolume3DToolGroup,
+    opacityShiftRange,
+    setCropControlVisible,
+    setVolume3DCropping,
+    setVolumeCut,
+    showVolume3D,
+    syncPlaneOutlines,
+    tagVolumeSeries,
+    volume3DLabel,
+    volume3DPresetsFor,
+} from "@/lib/volume3d";
 
 const { MouseBindings } = csToolsEnums;
 
@@ -75,6 +86,17 @@ const MPR_VIEWPORTS = [
 const VOLUME_3D_VIEWPORT = { id: "volume3d", label: "3D", is3D: true };
 
 const VOLUME_VIEWPORTS = [...MPR_VIEWPORTS, VOLUME_3D_VIEWPORT];
+
+const DEFAULT_SETTINGS_3D = {
+    preset: null,
+    shift: 0,
+    crop: false,
+    cut: null,
+    cutFlip: false,
+};
+
+// The planes the 3D view can be cut along
+const CUT_OPTIONS = MPR_VIEWPORTS.map((vp) => ({ id: vp.id, label: vp.label }));
 
 const CROSSHAIRS_CONFIG = {
     getReferenceLineColor: (viewportId) =>
@@ -157,13 +179,17 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
     const [openSettings, setOpenSettings] = useState({});
     const [volumeReady, setVolumeReady] = useState(false);
     const [viewportInfo, setViewportInfo] = useState({});
-    // Chosen 3D rendering preset; null until one is picked
-    const [chosenPreset3D, setChosenPreset3D] = useState(null);
+    // The 3D view's settings (see Volume3DSettings); a null preset means the
+    // first for the series' modality
+    const [settings3D, setSettings3D] = useState(DEFAULT_SETTINGS_3D);
+    // Whether the volume is showing in the 3D view yet
+    const [ready3D, setReady3D] = useState(false);
 
     const gridRef = useRef(null);
     const elementRefs = useRef({});
     const renderingEngineRef = useRef(null);
     const toolGroupRef = useRef(null);
+    const toolGroup3DRef = useRef(null);
     const activeToolRef = useRef(activeTool);
     const slabSettingsRef = useRef(slabSettings);
 
@@ -175,12 +201,13 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
         seriesData?.modality === "CT" &&
         (seriesData.instances?.[0]?.metadata?.samplesPerPixel ?? 1) === 1;
     const presets3D = volume3DPresetsFor(seriesData?.modality);
-    const preset3D = chosenPreset3D || presets3D[0].id;
-    // Read when the 3D view is first filled, without that waiting on it
-    const preset3DRef = useRef(preset3D);
+    const preset3D = settings3D.preset || presets3D[0].id;
+    const shiftRange3D = opacityShiftRange(seriesData?.modality);
+    // Read when the 3D view is first filled, without that waiting on them
+    const look3DRef = useRef({ preset: preset3D, shift: settings3D.shift });
     useEffect(() => {
-        preset3DRef.current = preset3D;
-    }, [preset3D]);
+        look3DRef.current = { preset: preset3D, shift: settings3D.shift };
+    }, [preset3D, settings3D.shift]);
 
     const updateViewportInfo = useCallback((viewportId, patch) => {
         setViewportInfo((prev) => ({
@@ -292,6 +319,8 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
         setSlabSettings({});
         setLoadProgress(null);
         setVolumeReady(false);
+        setReady3D(false);
+        setSettings3D(DEFAULT_SETTINGS_3D);
 
         const renderingEngine = new RenderingEngine(renderingEngineId);
         renderingEngineRef.current = renderingEngine;
@@ -321,10 +350,14 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
         applyToolBindings(toolGroup, activeToolRef.current);
 
         if (isVolume) {
-            createVolume3DToolGroup(toolGroup3DId).addViewport(
-                VOLUME_3D_VIEWPORT.id,
-                renderingEngineId,
-            );
+            // Draws the 3D view's crop box in the planes, once it is on
+            addCropControlTool(toolGroup, {
+                getReferenceLineColor: (viewportId) =>
+                    MPR_VIEWPORTS.find((vp) => vp.id === viewportId)?.color,
+            });
+            const toolGroup3D = createVolume3DToolGroup(toolGroup3DId);
+            toolGroup3D.addViewport(VOLUME_3D_VIEWPORT.id, renderingEngineId);
+            toolGroup3DRef.current = toolGroup3D;
         }
 
         // Keep the slice sliders and overlays in sync with what is displayed
@@ -438,6 +471,7 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
                 imageIds,
             });
             if (isCancelled) return;
+            tagVolumeSeries(volumeId, seriesData.id);
             volume.load();
 
             await setVolumesForViewports(
@@ -474,8 +508,10 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
                 await showVolume3D(
                     renderingEngine.getViewport(VOLUME_3D_VIEWPORT.id),
                     volumeId,
-                    preset3DRef.current,
+                    look3DRef.current.preset,
+                    look3DRef.current.shift,
                 );
+                if (!isCancelled) setReady3D(true);
             } catch (err) {
                 console.error("Failed to render the volume in 3D:", err);
                 if (!isCancelled) {
@@ -525,6 +561,7 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
             listeners.forEach((remove) => remove());
             ToolGroupManager.destroyToolGroup(toolGroupId);
             ToolGroupManager.destroyToolGroup(toolGroup3DId);
+            toolGroup3DRef.current = null;
             renderingEngine.destroy();
             if (renderingEngineRef.current === renderingEngine) {
                 renderingEngineRef.current = null;
@@ -548,17 +585,102 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
         }
     }, [activeTool]);
 
-    // Recolour the 3D view when another rendering preset is chosen
+    const shift3D = settings3D.shift;
+    const crop3D = settings3D.crop;
+    const cut3D = settings3D.cut;
+    const cutFlip3D = settings3D.cutFlip;
+
+    // Recolour the 3D view when another preset or opacity shift is chosen
     useEffect(() => {
-        if (!volumeReady) return;
+        if (!ready3D) return;
         const viewport = renderingEngineRef.current?.getViewport(
             VOLUME_3D_VIEWPORT.id,
         );
-        // Until the volume is in the 3D view, there is nothing to recolour
-        if (!viewport?.getDefaultActor?.()) return;
-        viewport.setProperties({ preset: preset3D });
-        viewport.render();
-    }, [volumeReady, preset3D]);
+        if (viewport) applyVolumePreset(viewport, preset3D, shift3D);
+    }, [ready3D, preset3D, shift3D]);
+
+    // The crop box: spheres in the 3D view, and its edges in the planes
+    useEffect(() => {
+        const toolGroup3D = toolGroup3DRef.current;
+        if (!ready3D || !toolGroup3D || !toolGroupRef.current) return;
+        setVolume3DCropping(
+            toolGroup3D,
+            renderingEngineRef.current?.getViewport(VOLUME_3D_VIEWPORT.id),
+            crop3D,
+        );
+        setCropControlVisible(toolGroupRef.current, crop3D);
+        renderingEngineRef.current?.render();
+    }, [ready3D, crop3D]);
+
+    // The planes' outlines in the 3D view (shown with the reference lines),
+    // and the cut along one of them, following the planes as they move
+    useEffect(() => {
+        const renderingEngine = renderingEngineRef.current;
+        if (!ready3D || !renderingEngine) return;
+        const viewport3D = renderingEngine.getViewport(VOLUME_3D_VIEWPORT.id);
+        if (!viewport3D) return;
+
+        const planeCamera = (id) => renderingEngine.getViewport(id)?.getCamera();
+
+        const sync = () => {
+            const planes = showCrosshairs
+                ? MPR_VIEWPORTS.map((vp) => {
+                      const camera = planeCamera(vp.id);
+                      return (
+                          camera && {
+                              key: vp.id,
+                              origin: camera.focalPoint,
+                              normal: camera.viewPlaneNormal,
+                              color: vp.color,
+                          }
+                      );
+                  }).filter(Boolean)
+                : [];
+            syncPlaneOutlines(viewport3D, planes);
+
+            // The crop box owns the volume's clipping while it is on
+            if (!crop3D) {
+                const camera = cut3D && planeCamera(cut3D);
+                setVolumeCut(
+                    viewport3D,
+                    camera && {
+                        origin: camera.focalPoint,
+                        normal: camera.viewPlaneNormal.map((v) =>
+                            cutFlip3D ? -v : v,
+                        ),
+                    },
+                );
+            }
+            viewport3D.render();
+        };
+
+        let frame = 0;
+        const schedule = () => {
+            if (!frame) {
+                frame = requestAnimationFrame(() => {
+                    frame = 0;
+                    sync();
+                });
+            }
+        };
+        const elements = MPR_VIEWPORTS.map(
+            (vp) => elementRefs.current[vp.id],
+        ).filter(Boolean);
+        elements.forEach((element) =>
+            element.addEventListener(Enums.Events.CAMERA_MODIFIED, schedule),
+        );
+        sync();
+
+        return () => {
+            cancelAnimationFrame(frame);
+            elements.forEach((element) =>
+                element.removeEventListener(
+                    Enums.Events.CAMERA_MODIFIED,
+                    schedule,
+                ),
+            );
+        };
+    }, [ready3D, showCrosshairs, crop3D, cut3D, cutFlip3D]);
 
     // Show, hide or activate the crosshairs
     useEffect(() => {
@@ -887,8 +1009,12 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
                                     style={{ ...overlayStyle, top: 6, right: 8 }}
                                 >
                                     {vp.is3D
-                                        ? presets3D.find((p) => p.id === preset3D)
-                                              ?.label
+                                        ? volume3DLabel(
+                                              presets3D,
+                                              { ...settings3D, preset: preset3D },
+                                              shiftRange3D,
+                                              CUT_OPTIONS,
+                                          )
                                         : slabLabel(slab)}
                                 </div>
                                 {!vp.is3D && (
@@ -998,8 +1124,15 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
                                 <Volume3DSettings
                                     label={vp.label}
                                     presets={presets3D}
-                                    preset={preset3D}
-                                    onPresetChange={setChosenPreset3D}
+                                    shiftRange={shiftRange3D}
+                                    cutOptions={CUT_OPTIONS}
+                                    settings={{ ...settings3D, preset: preset3D }}
+                                    onChange={(patch) =>
+                                        setSettings3D((prev) => ({
+                                            ...prev,
+                                            ...patch,
+                                        }))
+                                    }
                                 />
                             )}
                             {settingsOpen && !vp.is3D && (
@@ -1034,7 +1167,7 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
                 Left drag: selected tool · Wheel: scroll slices · Middle drag:
                 pan · Right drag: zoom
                 {isVolume &&
-                    " · In the 3D view, left drag turns the volume · Double-click a view to enlarge it · Drag a reference line to move that plane, or an end handle to rotate that plane on its own · A plane with a slab shows its thickness as two outer lines, which can be dragged by their handles"}
+                    " · In the 3D view, left drag turns the volume; with reference lines on, it outlines each plane, and its Settings can crop the volume or cut it along a plane · Double-click a view to enlarge it · Drag a reference line to move that plane, or an end handle to rotate that plane on its own · A plane with a slab shows its thickness as two outer lines, which can be dragged by their handles"}
             </p>
 
             <div style={infoStyle}>
