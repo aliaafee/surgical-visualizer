@@ -38,6 +38,11 @@ func main() {
 		return routes.RegisterDicomRoutes(app, e)
 	})
 
+	// Register patient routes
+	app.OnBeforeServe().Add(func(e *core.ServeEvent) error {
+		return routes.RegisterPatientRoutes(app, e)
+	})
+
 	// Finish processing series stored before post-processing existed
 	app.OnBeforeServe().Add(func(e *core.ServeEvent) error {
 		go routes.BackfillSeries(app)

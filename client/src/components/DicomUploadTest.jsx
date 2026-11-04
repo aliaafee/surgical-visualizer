@@ -1,7 +1,10 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import DicomViewer from "./DicomViewer";
+import PatientPicker from "./PatientPicker";
 import { pb } from "@/lib/pb";
 import { collectDroppedFiles } from "@/lib/dropped-files";
+import { fetchPatients } from "@/lib/patients";
+import { uploadDicomFiles } from "@/lib/upload";
 
 function formatSize(bytes) {
     if (!bytes) return "";
@@ -23,6 +26,9 @@ export default function DicomUploadTest({ onOpenOrView }) {
     const [anonymize, setAnonymize] = useState(false);
     const [dragActive, setDragActive] = useState(false);
     const [anonymizingStudyId, setAnonymizingStudyId] = useState(null);
+
+    const [patients, setPatients] = useState(null);
+    const [patient, setPatient] = useState(null);
 
     const [studies, setStudies] = useState(null);
     const [studiesError, setStudiesError] = useState("");
@@ -50,9 +56,45 @@ export default function DicomUploadTest({ onOpenOrView }) {
     function logout() {
         pb.authStore.clear();
         setLoggedIn(false);
+        setPatients(null);
+        setPatient(null);
+        setStudies(null);
     }
 
-    const CHUNK_SIZE = 10;
+    // Refreshes the patient list (and so the study counts in it)
+    const loadPatients = useCallback(async () => {
+        try {
+            setPatients(await fetchPatients());
+        } catch (err) {
+            setStudiesError(`Failed to fetch patients: ${err.message}`);
+        }
+    }, []);
+
+    useEffect(() => {
+        if (loggedIn) loadPatients();
+    }, [loggedIn, loadPatients]);
+
+    const fetchStudies = useCallback(async () => {
+        setStudiesError("");
+        setStudies(null);
+        setSelectedStudyId(null);
+        setSelectedStudyData(null);
+        if (!patient) return;
+        try {
+            const data = await pb.send(
+                `/api/visualizer/dicom/studies?patient=${encodeURIComponent(patient.id)}`,
+                {},
+            );
+            setStudies(data);
+        } catch (err) {
+            setStudiesError(err.message);
+        }
+    }, [patient]);
+
+    // The study list always shows the chosen patient's studies
+    useEffect(() => {
+        fetchStudies();
+    }, [fetchStudies]);
 
     async function handleDrop(e) {
         e.preventDefault();
@@ -71,80 +113,30 @@ export default function DicomUploadTest({ onOpenOrView }) {
     async function upload(e) {
         e.preventDefault();
         const files = pendingFiles;
-        if (files.length === 0) return;
+        if (files.length === 0 || !patient) return;
 
         setUploading(true);
         setUploadResult(null);
         setUploadError("");
         setUploadProgress("");
 
-        const merged = {
-            studyId: "",
-            studyInstanceUID: "",
-            series: [],
-            instances: [],
-            filesProcessed: 0,
-            errors: [],
-        };
-        const seenSeriesIds = new Set();
-
         try {
-            const chunks = [];
-            for (let i = 0; i < files.length; i += CHUNK_SIZE) {
-                chunks.push(files.slice(i, i + CHUNK_SIZE));
-            }
-
-            for (let i = 0; i < chunks.length; i++) {
-                setUploadProgress(
-                    `Uploading chunk ${i + 1} of ${chunks.length}…`,
-                );
-                const form = new FormData();
-                for (const file of chunks[i]) {
-                    form.append("files", file);
-                }
-                if (anonymize) form.append("anonymize", "true");
-                const data = await pb.send("/api/visualizer/dicom/upload", {
-                    method: "POST",
-                    body: form,
-                });
-
-                if (data.studyId) merged.studyId = data.studyId;
-                if (data.studyInstanceUID)
-                    merged.studyInstanceUID = data.studyInstanceUID;
-                for (const s of data.series ?? []) {
-                    if (!seenSeriesIds.has(s.id)) {
-                        seenSeriesIds.add(s.id);
-                        merged.series.push(s);
-                    }
-                }
-                merged.instances.push(...(data.instances ?? []));
-                merged.filesProcessed += data.filesProcessed ?? 0;
-                merged.errors.push(...(data.errors ?? []));
-            }
-
+            const merged = await uploadDicomFiles(files, {
+                patientId: patient.id,
+                anonymize,
+                onProgress: (sent, total) =>
+                    setUploadProgress(`Uploaded ${sent} of ${total} files…`),
+            });
             setUploadResult(merged);
             setPendingFiles([]);
             if (fileInputRef.current) fileInputRef.current.value = "";
             fetchStudies();
+            loadPatients();
         } catch (err) {
-            setUploadError(err.message);
+            setUploadError(err.response?.error || err.message);
         } finally {
             setUploading(false);
             setUploadProgress("");
-        }
-    }
-
-    async function fetchStudies() {
-        setStudiesError("");
-        setStudies(null);
-        setSelectedStudyId(null);
-        setSelectedStudyData(null);
-        try {
-            const data = await pb.send("/api/visualizer/dicom/studies", {});
-            console.log("Fetched studies:", data);
-            setStudies(data);
-        } catch (err) {
-            setStudiesError(err.message);
         }
     }
 
@@ -241,7 +233,7 @@ export default function DicomUploadTest({ onOpenOrView }) {
                     <button
                         style={viewBtnStyle}
                         disabled={!loggedIn}
-                        onClick={onOpenOrView}
+                        onClick={() => onOpenOrView()}
                     >
                         Open OR View
                     </button>
@@ -289,9 +281,44 @@ export default function DicomUploadTest({ onOpenOrView }) {
                 )}
             </section>
 
+            {/* ── Patient ── */}
+            <section style={{ marginBottom: "2rem" }}>
+                <h2>2. Choose a Patient</h2>
+                {loggedIn ? (
+                    <PatientPicker
+                        patients={patients}
+                        selectedId={patient?.id}
+                        onSelect={setPatient}
+                        onCreated={(created) => {
+                            setPatients((prev) =>
+                                [...(prev || []), created].sort((a, b) =>
+                                    a.name.localeCompare(b.name),
+                                ),
+                            );
+                            setPatient(created);
+                        }}
+                        files={pendingFiles}
+                        disabled={uploading}
+                    />
+                ) : (
+                    <p style={{ color: "#a6adc8" }}>Log in first.</p>
+                )}
+            </section>
+
             {/* ── Upload ── */}
             <section style={{ marginBottom: "2rem" }}>
-                <h2>2. Upload DICOM Files or Directories</h2>
+                <h2>3. Upload DICOM Files or Directories</h2>
+                {patient ? (
+                    <p style={{ margin: "0 0 0.5rem" }}>
+                        Studies will be filed under{" "}
+                        <strong>{patient.name}</strong>.
+                    </p>
+                ) : (
+                    <p style={{ margin: "0 0 0.5rem", color: "#a6adc8" }}>
+                        Choose or create the patient these files belong to
+                        before uploading.
+                    </p>
+                )}
                 <form
                     onSubmit={upload}
                     style={{
@@ -356,7 +383,10 @@ export default function DicomUploadTest({ onOpenOrView }) {
                         type="submit"
                         style={btnStyle}
                         disabled={
-                            !loggedIn || uploading || pendingFiles.length === 0
+                            !loggedIn ||
+                            uploading ||
+                            !patient ||
+                            pendingFiles.length === 0
                         }
                     >
                         {uploading ? "Uploading…" : "Upload"}
@@ -376,14 +406,18 @@ export default function DicomUploadTest({ onOpenOrView }) {
 
             {/* ── Studies list ── */}
             <section>
-                <h2>3. List Studies</h2>
-                <button
-                    style={btnStyle}
-                    disabled={!loggedIn}
-                    onClick={fetchStudies}
-                >
-                    Fetch Studies
-                </button>
+                <h2>
+                    4. {patient ? `${patient.name}'s Studies` : "Studies"}
+                </h2>
+                {patient ? (
+                    <button style={btnStyle} onClick={fetchStudies}>
+                        Refresh
+                    </button>
+                ) : (
+                    <p style={{ color: "#a6adc8" }}>
+                        Choose a patient to see their studies.
+                    </p>
+                )}
                 {studiesError && <p style={{ color: "red" }}>{studiesError}</p>}
                 {studies && (
                     <div style={resultBoxStyle}>

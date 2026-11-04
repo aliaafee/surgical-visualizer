@@ -106,6 +106,32 @@ export default function ViewportSettings({
     );
 }
 
+// Controls for a 3D (volume-rendered) viewport: which transfer function
+// colours the volume. `presets` are { id, label } for the series' modality.
+export function Volume3DSettings({ label, presets, preset, onPresetChange }) {
+    return (
+        <div style={settingsStyle} onDoubleClick={(e) => e.stopPropagation()}>
+            <div style={settingsRowStyle}>
+                <label style={fieldStyle}>
+                    Rendering
+                    <select
+                        value={preset}
+                        onChange={(e) => onPresetChange(e.target.value)}
+                        style={fieldInputStyle}
+                        aria-label={`${label} rendering preset`}
+                    >
+                        {presets.map((p) => (
+                            <option key={p.id} value={p.id}>
+                                {p.label}
+                            </option>
+                        ))}
+                    </select>
+                </label>
+            </div>
+        </div>
+    );
+}
+
 // Number input that only applies its value on Enter or when leaving the field,
 // so half-typed numbers are never sent to the viewport
 function NumberField({ label, value, min, onCommit }) {

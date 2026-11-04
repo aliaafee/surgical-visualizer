@@ -39,6 +39,9 @@ func RegisterDicomRoutes(app *pocketbase.PocketBase, e *core.ServeEvent) error {
 // handleUpload accepts one or more .dcm files under the "files" multipart field.
 // For each file it: parses DICOM metadata, upserts Study/Series records, creates
 // an Instance record, and persists the raw file to PocketBase storage.
+// The form value patient (a patient record id) is required: new studies are
+// filed under that patient, and files of a study already filed under another
+// patient are rejected.
 // With the form value anonymize=true, identifying attributes are stripped from
 // each file before anything is stored.
 func handleUpload(app *pocketbase.PocketBase) echo.HandlerFunc {
@@ -50,6 +53,14 @@ func handleUpload(app *pocketbase.PocketBase) echo.HandlerFunc {
 		fileHeaders := c.Request().MultipartForm.File["files"]
 		if len(fileHeaders) == 0 {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "no files provided under 'files' field"})
+		}
+
+		patientId := c.FormValue("patient")
+		if patientId == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "choose the patient these files belong to"})
+		}
+		if _, err := app.Dao().FindRecordById("patients", patientId); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "patient not found"})
 		}
 
 		instanceCollection, err := app.Dao().FindCollectionByNameOrId("instances")
@@ -109,6 +120,10 @@ func handleUpload(app *pocketbase.PocketBase) echo.HandlerFunc {
 			)
 			anonymizeFile := anonymize
 			if existingStudy != nil {
+				if existingStudy.GetString("patient") != patientId {
+					errs = append(errs, fmt.Sprintf("%s: this study is already filed under another patient", fh.Filename))
+					continue
+				}
 				if anonymize && !existingStudy.GetBool("isAnonymized") {
 					errs = append(errs, fmt.Sprintf("%s: study was already uploaded without anonymization; anonymize the existing study first", fh.Filename))
 					continue
@@ -129,7 +144,7 @@ func handleUpload(app *pocketbase.PocketBase) echo.HandlerFunc {
 				}
 			}
 
-			study, err := upsertStudy(app, dataset, anonymizeFile)
+			study, err := upsertStudy(app, dataset, patientId, anonymizeFile)
 			if err != nil {
 				errs = append(errs, fmt.Sprintf("%s: study error: %v", fh.Filename, err))
 				continue
@@ -220,11 +235,17 @@ func handleUpload(app *pocketbase.PocketBase) echo.HandlerFunc {
 
 // ─── Read endpoints ───────────────────────────────────────────────────────────
 
+// handleListStudies lists every study, or with ?patient=<id> only that
+// patient's studies.
 func handleListStudies(app *pocketbase.PocketBase) echo.HandlerFunc {
 	return func(c echo.Context) error {
+		filter, params := "1=1", dbx.Params{}
+		if patientId := c.QueryParam("patient"); patientId != "" {
+			filter, params = "patient = {:patient}", dbx.Params{"patient": patientId}
+		}
+
 		records, err := app.Dao().FindRecordsByFilter(
-			"studies", "1=1", "-created", 0, 0,
-			dbx.Params{},
+			"studies", filter, "-created", 0, 0, params,
 		)
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to fetch studies"})
@@ -232,23 +253,28 @@ func handleListStudies(app *pocketbase.PocketBase) echo.HandlerFunc {
 
 		result := make([]map[string]interface{}, 0, len(records))
 		for _, r := range records {
-			result = append(result, map[string]interface{}{
-				"id":               r.Id,
-				"studyInstanceUID": r.GetString("studyInstanceUID"),
-				"patientID":        r.GetString("patientID"),
-				"patientName":      r.GetString("patientName"),
-				"studyDate":        r.GetString("studyDate"),
-				"studyDescription": r.GetString("studyDescription"),
-				"modality":         r.GetString("modality"),
-				"uploadStatus":     r.GetString("uploadStatus"),
-				"isAnonymized":     r.GetBool("isAnonymized"),
-				"seriesCount":      r.Get("seriesCount"),
-				"instanceCount":    r.Get("instanceCount"),
-				"totalSize":        r.Get("totalSize"),
-				"created":          r.GetString("created"),
-			})
+			result = append(result, studySummary(r))
 		}
 		return c.JSON(http.StatusOK, result)
+	}
+}
+
+func studySummary(r *models.Record) map[string]interface{} {
+	return map[string]interface{}{
+		"id":               r.Id,
+		"patient":          r.GetString("patient"),
+		"studyInstanceUID": r.GetString("studyInstanceUID"),
+		"patientID":        r.GetString("patientID"),
+		"patientName":      r.GetString("patientName"),
+		"studyDate":        r.GetString("studyDate"),
+		"studyDescription": r.GetString("studyDescription"),
+		"modality":         r.GetString("modality"),
+		"uploadStatus":     r.GetString("uploadStatus"),
+		"isAnonymized":     r.GetBool("isAnonymized"),
+		"seriesCount":      r.Get("seriesCount"),
+		"instanceCount":    r.Get("instanceCount"),
+		"totalSize":        r.Get("totalSize"),
+		"created":          r.GetString("created"),
 	}
 }
 
@@ -288,6 +314,7 @@ func handleGetStudy(app *pocketbase.PocketBase) echo.HandlerFunc {
 
 		return c.JSON(http.StatusOK, map[string]interface{}{
 			"id":                study.Id,
+			"patient":           study.GetString("patient"),
 			"studyInstanceUID":  study.GetString("studyInstanceUID"),
 			"patientID":         study.GetString("patientID"),
 			"patientName":       study.GetString("patientName"),
@@ -345,6 +372,7 @@ func handleGetSeries(app *pocketbase.PocketBase) echo.HandlerFunc {
 		if study, err := app.Dao().FindRecordById("studies", series.GetString("study")); err == nil {
 			studyResult = map[string]interface{}{
 				"id":               study.Id,
+				"patient":          study.GetString("patient"),
 				"patientID":        study.GetString("patientID"),
 				"patientName":      study.GetString("patientName"),
 				"patientBirthDate": study.GetString("patientBirthDate"),
@@ -428,7 +456,7 @@ func handleGetInstanceFile(app *pocketbase.PocketBase) echo.HandlerFunc {
 
 // ─── Upsert helpers ───────────────────────────────────────────────────────────
 
-func upsertStudy(app *pocketbase.PocketBase, dataset dicom.Dataset, anonymized bool) (*models.Record, error) {
+func upsertStudy(app *pocketbase.PocketBase, dataset dicom.Dataset, patientId string, anonymized bool) (*models.Record, error) {
 	studyUID := getStringDICOMTag(dataset, tag.StudyInstanceUID)
 	if studyUID == "" {
 		return nil, fmt.Errorf("missing StudyInstanceUID")
@@ -449,6 +477,7 @@ func upsertStudy(app *pocketbase.PocketBase, dataset dicom.Dataset, anonymized b
 
 	record := models.NewRecord(collection)
 	record.Set("studyInstanceUID", studyUID)
+	record.Set("patient", patientId)
 	record.Set("patientID", getStringDICOMTag(dataset, tag.PatientID))
 	record.Set("patientName", getStringDICOMTag(dataset, tag.PatientName))
 	record.Set("patientBirthDate", formatDICOMDate(getStringDICOMTag(dataset, tag.PatientBirthDate)))

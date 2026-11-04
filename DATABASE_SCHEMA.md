@@ -26,6 +26,28 @@ PocketBase provides a built-in `users` collection with authentication. We'll ext
 
 ---
 
+### 1a. Patients Collection
+
+A patient groups the studies uploaded for them. The uploader chooses (or creates) the patient before uploading; studies are never matched to a patient automatically.
+
+**Fields:**
+
+| Field Name | Type | Required | Options | Description |
+|------------|------|----------|---------|-------------|
+| `name` | text | Yes | - | Patient name, as entered |
+| `patientID` | text | No | Indexed | Patient identifier (MRN) |
+| `birthDate` | text | No | - | Date of birth (YYYY-MM-DD) |
+| `sex` | text | No | - | M, F or O |
+| `notes` | text | No | - | Free-text notes |
+
+**API Rules:** List/View/Create/Update: `@request.auth.id != ""`. Delete: disabled.
+
+**Notes:**
+- Studies keep their own copy of the patient demographics read from their DICOM files, so a study's `patientName` etc. can differ from its patient's.
+- Anonymization stays per study; a patient record is not anonymized.
+
+---
+
 ### 2. Studies Collection
 
 Represents a DICOM study (typically a complete imaging session for a patient).
@@ -34,6 +56,7 @@ Represents a DICOM study (typically a complete imaging session for a patient).
 
 | Field Name | Type | Required | Options | Description |
 |------------|------|----------|---------|-------------|
+| `patient` | relation | Yes (set on upload) | → patients | Patient the study is filed under |
 | `studyInstanceUID` | text | Yes | Unique | DICOM Study Instance UID |
 | `patientID` | text | Yes | - | Patient identifier (can be anonymized) |
 | `patientName` | text | No | - | Patient name (can be anonymized) |
@@ -363,6 +386,9 @@ users
   ├─→ measurements (author)
   ├─→ segmentations (author)
   └─→ exports (author)
+
+patients
+  └─→ studies (one-to-many)
 
 studies
   ├─→ series (one-to-many)

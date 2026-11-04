@@ -17,7 +17,7 @@ import {
     StackScrollTool,
 } from "@cornerstonejs/tools";
 import { pb } from "@/lib/pb";
-import ViewportSettings from "./ViewportSettings";
+import ViewportSettings, { Volume3DSettings } from "./ViewportSettings";
 import {
     DEFAULT_SLAB,
     slabLabel,
@@ -31,7 +31,12 @@ import {
     loadImages,
     MPR_UNAVAILABLE_MESSAGE,
     VIEWER_TOOLS,
+    createVolume3DToolGroup,
+    showVolume3D,
+    volume3DPresetsFor,
 } from "@/lib/cornerstone";
+import { fetchPatients, patientLabel } from "@/lib/patients";
+import PatientPicker from "./PatientPicker";
 
 const STORAGE_KEY = "or-view-layout";
 const MAX_GRID = 4;
@@ -39,7 +44,9 @@ const MAX_GRID = 4;
 // several cells can legitimately ask for the same thing at once
 const NO_AUTO_CANCEL = { requestKey: null };
 
-// What a cell can show: the series slice by slice, or one plane of its volume
+// What a cell can show: the series slice by slice, one plane of its volume,
+// or the whole volume rendered in 3D
+const VOLUME_3D_VIEW = "volume3d";
 const VIEWS = [
     { id: "stack", label: "Stack" },
     {
@@ -57,7 +64,14 @@ const VIEWS = [
         label: "MPR Coronal",
         orientation: Enums.OrientationAxis.CORONAL,
     },
+    { id: VOLUME_3D_VIEW, label: "3D Volume", is3D: true },
 ];
+
+// Whether a cell's view is one of the MPR planes, whose section can be
+// moved and turned from its line in the other cells
+function isPlaneView(view) {
+    return view !== "stack" && view !== VOLUME_3D_VIEW;
+}
 
 const TOOLS = [
     { name: WindowLevelTool.toolName, label: "Window/Level" },
@@ -108,9 +122,16 @@ const HANDLE_OFFSET = 0.3;
 
 let orViewInstanceCount = 0;
 
-function loadLayout() {
+// Each patient's OR layout is remembered separately
+function storageKeyFor(patientId) {
+    return `${STORAGE_KEY}:${patientId}`;
+}
+
+function loadLayout(patientId) {
     try {
-        const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
+        const saved = JSON.parse(
+            localStorage.getItem(storageKeyFor(patientId)),
+        );
         const rows = Math.min(MAX_GRID, Math.max(1, saved.rows | 0));
         const cols = Math.min(MAX_GRID, Math.max(1, saved.cols | 0));
         const cells = Array.from(
@@ -289,11 +310,79 @@ function lineCentreOn(centre, camera) {
     );
 }
 
-export default function OrView({ onClose }) {
+// The OR view works on one patient at a time, so it starts by asking which
+export default function OrView({ patientId, onChoosePatient, onClose }) {
+    if (!patientId) {
+        return <OrPatientChooser onChoose={onChoosePatient} onClose={onClose} />;
+    }
+    return (
+        <OrPatientView
+            patientId={patientId}
+            onChangePatient={() => onChoosePatient(null)}
+            onClose={onClose}
+        />
+    );
+}
+
+function OrPatientChooser({ onChoose, onClose }) {
+    const [patients, setPatients] = useState(null);
+    const [error, setError] = useState("");
+
+    useEffect(() => {
+        let isCancelled = false;
+        fetchPatients(NO_AUTO_CANCEL)
+            .then((data) => {
+                if (!isCancelled) setPatients(data);
+            })
+            .catch((err) => {
+                if (!isCancelled) {
+                    setError(err.message || "Failed to fetch patients");
+                }
+            });
+        return () => {
+            isCancelled = true;
+        };
+    }, []);
+
+    return (
+        <div style={pageStyle}>
+            <div style={toolbarStyle}>
+                <div style={toolbarGroupStyle}>
+                    {onClose && (
+                        <button onClick={onClose} style={btnStyle}>
+                            ← Back
+                        </button>
+                    )}
+                    <strong style={{ alignSelf: "center" }}>OR View</strong>
+                </div>
+            </div>
+            <div style={chooserStyle}>
+                <h2 style={{ margin: 0 }}>Which patient?</h2>
+                <p style={{ margin: 0, color: "#a6adc8" }}>
+                    The OR view shows one patient&apos;s studies at a time.
+                </p>
+                <PatientPicker
+                    patients={patients}
+                    onSelect={(patient) => patient && onChoose(patient.id)}
+                    allowCreate={false}
+                />
+                {patients?.length === 0 && (
+                    <p style={{ margin: 0, color: "#a6adc8" }}>
+                        Create a patient and upload their studies first.
+                    </p>
+                )}
+                {error && <p style={{ color: "red", margin: 0 }}>{error}</p>}
+            </div>
+        </div>
+    );
+}
+
+function OrPatientView({ patientId, onChangePatient, onClose }) {
     const [initialized, setInitialized] = useState(false);
     const [error, setError] = useState("");
-    const [layout, setLayout] = useState(loadLayout);
+    const [layout, setLayout] = useState(() => loadLayout(patientId));
     const [engine, setEngine] = useState(null);
+    const [patient, setPatient] = useState(null);
     const [studies, setStudies] = useState(null);
     const [studySeries, setStudySeries] = useState({});
     const [readyCells, setReadyCells] = useState({});
@@ -358,34 +447,63 @@ export default function OrView({ onClose }) {
         };
     }, [initialized]);
 
-    // Studies offered in each cell's picker
+    // The patient, and their studies offered in each cell's picker
     useEffect(() => {
         let isCancelled = false;
 
-        pb.send("/api/visualizer/dicom/studies", NO_AUTO_CANCEL)
+        pb.send(
+            `/api/visualizer/patients/${encodeURIComponent(patientId)}`,
+            NO_AUTO_CANCEL,
+        )
             .then((data) => {
-                if (!isCancelled) setStudies(data);
+                if (isCancelled) return;
+                setPatient(data);
+                setStudies(data.studies || []);
+                // A remembered cell whose study is no longer this patient's
+                // is emptied
+                const own = new Set((data.studies || []).map((s) => s.id));
+                setLayout((prev) =>
+                    prev.cells.every((cell) => !cell || own.has(cell.studyId))
+                        ? prev
+                        : {
+                              ...prev,
+                              cells: prev.cells.map((cell) =>
+                                  cell && own.has(cell.studyId) ? cell : null,
+                              ),
+                          },
+                );
             })
             .catch((err) => {
-                console.error("Failed to fetch studies:", err);
+                console.error("Failed to fetch patient:", err);
                 if (!isCancelled) {
-                    setError(err.message || "Failed to fetch studies");
+                    setError(
+                        err.status === 404
+                            ? "This patient no longer exists"
+                            : err.message || "Failed to fetch patient",
+                    );
                 }
             });
 
         return () => {
             isCancelled = true;
         };
-    }, []);
+    }, [patientId]);
+
+    // Only this patient's studies may be shown, so nothing is loaded into
+    // the cells until it is known which studies those are
+    const ownStudyIds = studies && new Set(studies.map((study) => study.id));
 
     // Remember the grid between visits
     useEffect(() => {
         try {
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(layout));
+            localStorage.setItem(
+                storageKeyFor(patientId),
+                JSON.stringify(layout),
+            );
         } catch {
             // Storage unavailable: the layout just won't be remembered
         }
-    }, [layout]);
+    }, [layout, patientId]);
 
     const loadStudySeries = useCallback(
         async (studyId) => {
@@ -515,25 +633,37 @@ export default function OrView({ onClose }) {
         setActiveCell((prev) => Math.min(prev, nextRows * nextCols - 1));
     };
 
-    // One set of mouse tools shared by every loaded cell
+    // One set of mouse tools shared by every loaded slice cell, and another
+    // (turn, pan, zoom) shared by the 3D cells
     useEffect(() => {
         if (!engine) return;
 
         const infos = Object.values(readyCells);
-        if (!infos.length) return;
+        const sliceInfos = infos.filter((info) => info.view !== VOLUME_3D_VIEW);
+        const volumeInfos = infos.filter((info) => info.view === VOLUME_3D_VIEW);
 
         const id = toolGroupIdFor(engine);
-        const toolGroup = ToolGroupManager.createToolGroup(id);
-        VIEWER_TOOLS.forEach(({ toolName }) => toolGroup.addTool(toolName));
-        infos.forEach((info) =>
-            toolGroup.addViewport(info.viewportId, engine.id),
-        );
-        toolGroupRef.current = toolGroup;
-        applyToolBindings(toolGroup, activeToolRef.current);
+        const id3D = `${id}-3d`;
+        if (sliceInfos.length) {
+            const toolGroup = ToolGroupManager.createToolGroup(id);
+            VIEWER_TOOLS.forEach(({ toolName }) => toolGroup.addTool(toolName));
+            sliceInfos.forEach((info) =>
+                toolGroup.addViewport(info.viewportId, engine.id),
+            );
+            toolGroupRef.current = toolGroup;
+            applyToolBindings(toolGroup, activeToolRef.current);
+        }
+        if (volumeInfos.length) {
+            const toolGroup3D = createVolume3DToolGroup(id3D);
+            volumeInfos.forEach((info) =>
+                toolGroup3D.addViewport(info.viewportId, engine.id),
+            );
+        }
 
         return () => {
             toolGroupRef.current = null;
             ToolGroupManager.destroyToolGroup(id);
+            ToolGroupManager.destroyToolGroup(id3D);
         };
     }, [engine, readyCells]);
 
@@ -559,12 +689,14 @@ export default function OrView({ onClose }) {
             if (showReferenceLines) {
                 const sections = Object.keys(readyCells)
                     .map(Number)
-                    .filter((index) => readyCells[index].view !== "stack");
+                    .filter((index) => isPlaneView(readyCells[index].view));
                 const sources = [...new Set([activeCell, ...sections])];
 
                 sources.forEach((sourceIndex) => {
                     const source = readyCells[sourceIndex];
                     if (!source?.frameOfReferenceUID) return;
+                    // A rendered volume has no plane to draw
+                    if (source.view === VOLUME_3D_VIEW) return;
                     const sourceCamera = engine
                         .getViewport(source.viewportId)
                         ?.getCamera();
@@ -575,7 +707,7 @@ export default function OrView({ onClose }) {
                     const slab = cellSlabs[sourceIndex];
                     const thickness = !showSliceThickness
                         ? 0
-                        : source.view !== "stack" &&
+                        : isPlaneView(source.view) &&
                             slab &&
                             slab.projection !== "none"
                           ? slab.thickness
@@ -583,6 +715,8 @@ export default function OrView({ onClose }) {
 
                     Object.entries(readyCells).forEach(([index, target]) => {
                         if (Number(index) === sourceIndex) return;
+                        // Flat lines don't belong over a turnable 3D view
+                        if (target.view === VOLUME_3D_VIEW) return;
                         if (
                             target.frameOfReferenceUID !==
                             source.frameOfReferenceUID
@@ -804,6 +938,12 @@ export default function OrView({ onClose }) {
         Object.values(readyCells).forEach((info) => {
             const viewport = engine.getViewport(info.viewportId);
             if (!viewport) return;
+            if (info.view === VOLUME_3D_VIEW) {
+                // Back to the starting angle, keeping its colouring
+                viewport.resetCamera();
+                viewport.render();
+                return;
+            }
             if (info.view !== "stack") {
                 viewport.setBlendMode(Enums.BlendModes.COMPOSITE);
             }
@@ -819,10 +959,16 @@ export default function OrView({ onClose }) {
                 <div style={toolbarGroupStyle}>
                     {onClose && (
                         <button onClick={onClose} style={btnStyle}>
-                            ← Studies
+                            ← Back
                         </button>
                     )}
                     <strong style={{ alignSelf: "center" }}>OR View</strong>
+                    <span style={{ alignSelf: "center" }}>
+                        {patient ? patientLabel(patient) : "Loading patient…"}
+                    </span>
+                    <button onClick={onChangePatient} style={btnStyle}>
+                        Change patient
+                    </button>
                 </div>
 
                 <div style={toolbarGroupStyle}>
@@ -914,7 +1060,11 @@ export default function OrView({ onClose }) {
                     <OrViewCell
                         key={index}
                         index={index}
-                        content={content}
+                        content={
+                            content && ownStudyIds?.has(content.studyId)
+                                ? content
+                                : null
+                        }
                         engine={engine}
                         active={index === activeCell}
                         referenceLines={referenceLines[index]}
@@ -965,6 +1115,9 @@ function OrViewCell({
 
     const elementRef = useRef(null);
     const lineDragRef = useRef(null);
+    // The 3D preset chosen for this cell, read when its volume is first
+    // rendered without that load waiting on it
+    const preset3DRef = useRef(content?.preset || null);
 
     // Pointer position on this cell's canvas
     const canvasPoint = (evt) => {
@@ -1015,22 +1168,24 @@ function OrViewCell({
         const viewportId = viewportIdForCell(index);
         const viewDef = VIEWS.find((v) => v.id === view) || VIEWS[0];
         const isVolume = viewDef.id !== "stack";
+        const is3D = Boolean(viewDef.is3D);
 
-        if (isVolume && getShouldUseCPURendering()) {
-            setStatus("");
-            setError(MPR_UNAVAILABLE_MESSAGE);
-            return;
-        }
+        // Shown instead by the render below
+        if (isVolume && getShouldUseCPURendering()) return;
 
         engine.enableElement({
             viewportId,
-            type: isVolume
-                ? Enums.ViewportType.ORTHOGRAPHIC
-                : Enums.ViewportType.STACK,
+            type: is3D
+                ? Enums.ViewportType.VOLUME_3D
+                : isVolume
+                  ? Enums.ViewportType.ORTHOGRAPHIC
+                  : Enums.ViewportType.STACK,
             element,
             defaultOptions: {
                 background: [0, 0, 0],
-                ...(isVolume ? { orientation: viewDef.orientation } : {}),
+                ...(viewDef.orientation
+                    ? { orientation: viewDef.orientation }
+                    : {}),
             },
         });
         const viewport = engine.getViewport(viewportId);
@@ -1085,24 +1240,37 @@ function OrViewCell({
                     },
                 );
                 if (isCancelled) return;
-                await viewport.setVolumes([{ volumeId }]);
+                if (is3D) {
+                    setStatus("Rendering volume…");
+                    await showVolume3D(
+                        viewport,
+                        volumeId,
+                        preset3DRef.current ||
+                            volume3DPresetsFor(series.modality)[0].id,
+                    );
+                } else {
+                    await viewport.setVolumes([{ volumeId }]);
+                }
             } else {
                 await viewport.setStack(series.imageIds, 0);
             }
             if (isCancelled) return;
             viewport.render();
 
-            const range = viewport.getProperties()?.voiRange;
-            patchInfo({
-                index: viewport.getSliceIndex(),
-                count: viewport.getNumberOfSlices(),
-                ...(range
-                    ? {
-                          windowWidth: range.upper - range.lower,
-                          windowCenter: (range.upper + range.lower) / 2,
-                      }
-                    : {}),
-            });
+            // A rendered volume has no slices or window to report
+            if (!is3D) {
+                const range = viewport.getProperties()?.voiRange;
+                patchInfo({
+                    index: viewport.getSliceIndex(),
+                    count: viewport.getNumberOfSlices(),
+                    ...(range
+                        ? {
+                              windowWidth: range.upper - range.lower,
+                              windowCenter: (range.upper + range.lower) / 2,
+                          }
+                        : {}),
+                });
+            }
             setStatus("");
 
             onReady(index, {
@@ -1152,8 +1320,27 @@ function OrViewCell({
         };
     }, [engine, index, seriesId, view, getSeries, getVolume, onReady]);
 
+    // A 3D cell's rendering preset: the one chosen for it (kept with the
+    // cell's layout), else the first for the series' modality
+    const presets3D = volume3DPresetsFor(details?.modality);
+    const preset3D = content?.preset || presets3D[0].id;
+
+    // Recolour the volume whenever another preset is chosen; until the
+    // volume is in the viewport there is nothing to recolour
+    useEffect(() => {
+        preset3DRef.current = content?.preset || null;
+        if (view !== VOLUME_3D_VIEW || !details) return;
+        const viewport = engine?.getViewport(viewportIdForCell(index));
+        if (!viewport?.getDefaultActor?.()) return;
+        viewport.setProperties({ preset: preset3D });
+        viewport.render();
+    }, [engine, index, view, details, content?.preset, preset3D]);
+
     const viewLabel = VIEWS.find((v) => v.id === view)?.label;
     const isVolume = Boolean(view) && view !== "stack";
+    const is3D = view === VOLUME_3D_VIEW;
+    const shownError =
+        isVolume && getShouldUseCPURendering() ? MPR_UNAVAILABLE_MESSAGE : error;
     const sliceCount = info.count || 0;
     // Window presets are in Hounsfield units, so greyscale CT only
     const isCT =
@@ -1200,7 +1387,11 @@ function OrViewCell({
                   details.sliceThickness &&
                       `${Number(Number(details.sliceThickness).toFixed(3))} mm thick`,
               ],
-              [slabLabel(slab)],
+              [
+                  is3D
+                      ? presets3D.find((p) => p.id === preset3D)?.label
+                      : slabLabel(slab),
+              ],
           ]
         : [];
     const studyLines = details
@@ -1394,10 +1585,10 @@ function OrViewCell({
                     </>
                 )}
 
-                {(status || error) && !showPicker && (
+                {(status || shownError) && !showPicker && (
                     <div style={statusStyle}>
-                        <span style={error ? { color: "#f38ba8" } : null}>
-                            {error || status}
+                        <span style={shownError ? { color: "#f38ba8" } : null}>
+                            {shownError || status}
                         </span>
                     </div>
                 )}
@@ -1420,6 +1611,8 @@ function OrViewCell({
 
             {content && settingsOpen && (
                 <div style={cellSettingsStyle}>
+                    {/* A rendered volume has no slices to step through */}
+                    {!is3D && (
                     <div style={sliderRowStyle}>
                         <button
                             onClick={() => showSlice((info.index ?? 0) - 1)}
@@ -1448,6 +1641,7 @@ function OrViewCell({
                             ›
                         </button>
                     </div>
+                    )}
                     <div style={identityRowStyle}>
                         <label style={identityFieldStyle}>
                             Label
@@ -1476,16 +1670,27 @@ function OrViewCell({
                             />
                         </label>
                     </div>
-                    <ViewportSettings
-                        label={`Cell ${index + 1}`}
-                        isVolume={isVolume}
-                        isCT={isCT}
-                        slab={slab}
-                        windowWidth={info.windowWidth}
-                        windowCenter={info.windowCenter}
-                        onSlabChange={changeSlab}
-                        onWindowChange={changeWindow}
-                    />
+                    {is3D ? (
+                        <Volume3DSettings
+                            label={`Cell ${index + 1}`}
+                            presets={presets3D}
+                            preset={preset3D}
+                            onPresetChange={(preset) =>
+                                onUpdate(index, { preset })
+                            }
+                        />
+                    ) : (
+                        <ViewportSettings
+                            label={`Cell ${index + 1}`}
+                            isVolume={isVolume}
+                            isCT={isCT}
+                            slab={slab}
+                            windowWidth={info.windowWidth}
+                            windowCenter={info.windowCenter}
+                            onSlabChange={changeSlab}
+                            onWindowChange={changeWindow}
+                        />
+                    )}
                 </div>
             )}
         </div>
@@ -1533,12 +1738,15 @@ function CellPicker({
                 aria-label={`Cell ${index + 1} study`}
             >
                 <option value="">
-                    {studies ? "Select study…" : "Loading studies…"}
+                    {!studies
+                        ? "Loading studies…"
+                        : studies.length
+                          ? "Select study…"
+                          : "This patient has no studies"}
                 </option>
                 {(studies || []).map((study) => (
                     <option key={study.id} value={study.id}>
-                        {study.studyDescription || "No description"} —{" "}
-                        {study.patientName || "Unknown"} (
+                        {study.studyDescription || "No description"} (
                         {study.studyDate?.slice(0, 10) || "no date"})
                     </option>
                 ))}
@@ -1613,6 +1821,17 @@ const pageStyle = {
     fontFamily: "monospace",
     background: "#11111b",
     color: "#cdd6f4",
+};
+
+const chooserStyle = {
+    display: "flex",
+    flexDirection: "column",
+    gap: "0.75rem",
+    width: "100%",
+    maxWidth: 560,
+    margin: "3rem auto",
+    padding: "0 1rem",
+    boxSizing: "border-box",
 };
 
 const toolbarStyle = {

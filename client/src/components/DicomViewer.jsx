@@ -22,7 +22,7 @@ import {
     CrosshairsTool,
 } from "@cornerstonejs/tools";
 import { pb } from "@/lib/pb";
-import ViewportSettings from "./ViewportSettings";
+import ViewportSettings, { Volume3DSettings } from "./ViewportSettings";
 import {
     PROJECTIONS,
     DEFAULT_SLAB,
@@ -40,6 +40,9 @@ import {
     MPR_UNAVAILABLE_MESSAGE,
     PLANE_COLORS,
     VIEWER_TOOLS,
+    createVolume3DToolGroup,
+    showVolume3D,
+    volume3DPresetsFor,
 } from "@/lib/cornerstone";
 
 const { MouseBindings } = csToolsEnums;
@@ -66,6 +69,12 @@ const MPR_VIEWPORTS = [
         color: PLANE_COLORS.coronal,
     },
 ];
+
+// The volume rendered in 3D, shown beside the three planes. It has its own
+// tools (turn, pan, zoom) and takes no part in crosshairs or slabs.
+const VOLUME_3D_VIEWPORT = { id: "volume3d", label: "3D", is3D: true };
+
+const VOLUME_VIEWPORTS = [...MPR_VIEWPORTS, VOLUME_3D_VIEWPORT];
 
 const CROSSHAIRS_CONFIG = {
     getReferenceLineColor: (viewportId) =>
@@ -148,6 +157,8 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
     const [openSettings, setOpenSettings] = useState({});
     const [volumeReady, setVolumeReady] = useState(false);
     const [viewportInfo, setViewportInfo] = useState({});
+    // Chosen 3D rendering preset; null until one is picked
+    const [chosenPreset3D, setChosenPreset3D] = useState(null);
 
     const gridRef = useRef(null);
     const elementRefs = useRef({});
@@ -158,11 +169,18 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
 
     const isVolume =
         mode === "mpr" && Boolean(seriesData?.is3DCapable) && !forceStack;
-    const viewports = isVolume ? MPR_VIEWPORTS : STACK_VIEWPORTS;
+    const viewports = isVolume ? VOLUME_VIEWPORTS : STACK_VIEWPORTS;
     // Window presets are in Hounsfield units, so greyscale CT only
     const isCT =
         seriesData?.modality === "CT" &&
         (seriesData.instances?.[0]?.metadata?.samplesPerPixel ?? 1) === 1;
+    const presets3D = volume3DPresetsFor(seriesData?.modality);
+    const preset3D = chosenPreset3D || presets3D[0].id;
+    // Read when the 3D view is first filled, without that waiting on it
+    const preset3DRef = useRef(preset3D);
+    useEffect(() => {
+        preset3DRef.current = preset3D;
+    }, [preset3D]);
 
     const updateViewportInfo = useCallback((viewportId, patch) => {
         setViewportInfo((prev) => ({
@@ -244,7 +262,7 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
     useEffect(() => {
         if (!initialized || !seriesData?.instances?.length) return;
 
-        const activeViewports = isVolume ? MPR_VIEWPORTS : STACK_VIEWPORTS;
+        const activeViewports = isVolume ? VOLUME_VIEWPORTS : STACK_VIEWPORTS;
         const elements = activeViewports.map(
             (vp) => elementRefs.current[vp.id],
         );
@@ -259,7 +277,13 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
         const instanceNumber = ++viewerInstanceCount;
         const renderingEngineId = `viewerEngine-${instanceNumber}`;
         const toolGroupId = `viewerTools-${instanceNumber}`;
-        const viewportIds = activeViewports.map((vp) => vp.id);
+        const toolGroup3DId = `viewerTools3D-${instanceNumber}`;
+        // The slice viewports; the 3D one is handled on its own
+        const planeViewports = activeViewports.filter((vp) => !vp.is3D);
+        const planeElements = planeViewports.map(
+            (vp) => elementRefs.current[vp.id],
+        );
+        const viewportIds = planeViewports.map((vp) => vp.id);
         const imageIds = seriesData.instances.map((instance) =>
             instanceImageId(instance.id),
         );
@@ -275,13 +299,15 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
         activeViewports.forEach((vp, i) => {
             renderingEngine.enableElement({
                 viewportId: vp.id,
-                type: isVolume
-                    ? Enums.ViewportType.ORTHOGRAPHIC
-                    : Enums.ViewportType.STACK,
+                type: vp.is3D
+                    ? Enums.ViewportType.VOLUME_3D
+                    : isVolume
+                      ? Enums.ViewportType.ORTHOGRAPHIC
+                      : Enums.ViewportType.STACK,
                 element: elements[i],
                 defaultOptions: {
                     background: [0, 0, 0],
-                    ...(isVolume ? { orientation: vp.orientation } : {}),
+                    ...(vp.orientation ? { orientation: vp.orientation } : {}),
                 },
             });
         });
@@ -294,14 +320,25 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
         );
         applyToolBindings(toolGroup, activeToolRef.current);
 
+        if (isVolume) {
+            createVolume3DToolGroup(toolGroup3DId).addViewport(
+                VOLUME_3D_VIEWPORT.id,
+                renderingEngineId,
+            );
+        }
+
         // Keep the slice sliders and overlays in sync with what is displayed
         const listeners = [];
         const listen = (element, type, handler) => {
             element.addEventListener(type, handler);
             listeners.push(() => element.removeEventListener(type, handler));
         };
-        activeViewports.forEach((vp, i) => {
-            const element = elements[i];
+        // The right mouse button is bound to zoom
+        elements.forEach((element) =>
+            listen(element, "contextmenu", (evt) => evt.preventDefault()),
+        );
+        planeViewports.forEach((vp, i) => {
+            const element = planeElements[i];
             listen(element, Enums.Events.STACK_NEW_IMAGE, (evt) => {
                 const { image, imageIdIndex } = evt.detail;
                 updateViewportInfo(vp.id, {
@@ -321,8 +358,6 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
             listen(element, Enums.Events.VOI_MODIFIED, (evt) => {
                 updateViewportInfo(vp.id, voiToWindow(evt.detail.range));
             });
-            // The right mouse button is bound to zoom
-            listen(element, "contextmenu", (evt) => evt.preventDefault());
         });
 
         // Dragging a slab handle on a reference line changes that plane's
@@ -368,7 +403,7 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
             }
         };
         if (isVolume) {
-            elements.forEach((element) => {
+            planeElements.forEach((element) => {
                 listen(element, csToolsEnums.Events.MOUSE_DRAG, syncSlabs);
                 listen(element, csToolsEnums.Events.MOUSE_UP, syncSlabs);
             });
@@ -432,6 +467,21 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
                 viewport.setSlabThickness(slabThickness);
             };
             setVolumeReady(true);
+
+            // A 3D view that fails (e.g. the GPU can't hold the volume as
+            // a texture) leaves the planes usable
+            try {
+                await showVolume3D(
+                    renderingEngine.getViewport(VOLUME_3D_VIEWPORT.id),
+                    volumeId,
+                    preset3DRef.current,
+                );
+            } catch (err) {
+                console.error("Failed to render the volume in 3D:", err);
+                if (!isCancelled) {
+                    setNotice("The 3D view could not render this volume.");
+                }
+            }
         }
 
         async function showStack() {
@@ -474,6 +524,7 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
             resizeObserver.disconnect();
             listeners.forEach((remove) => remove());
             ToolGroupManager.destroyToolGroup(toolGroupId);
+            ToolGroupManager.destroyToolGroup(toolGroup3DId);
             renderingEngine.destroy();
             if (renderingEngineRef.current === renderingEngine) {
                 renderingEngineRef.current = null;
@@ -496,6 +547,18 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
             applyToolBindings(toolGroupRef.current, activeTool);
         }
     }, [activeTool]);
+
+    // Recolour the 3D view when another rendering preset is chosen
+    useEffect(() => {
+        if (!volumeReady) return;
+        const viewport = renderingEngineRef.current?.getViewport(
+            VOLUME_3D_VIEWPORT.id,
+        );
+        // Until the volume is in the 3D view, there is nothing to recolour
+        if (!viewport?.getDefaultActor?.()) return;
+        viewport.setProperties({ preset: preset3D });
+        viewport.render();
+    }, [volumeReady, preset3D]);
 
     // Show, hide or activate the crosshairs
     useEffect(() => {
@@ -605,6 +668,12 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
     const resetView = () => {
         setSlabSettings({});
         forEachViewport((viewport, vp) => {
+            if (vp.is3D) {
+                // Back to the starting angle, keeping its colouring
+                viewport.resetCamera();
+                viewport.render();
+                return;
+            }
             if (isVolume) viewport.setBlendMode(Enums.BlendModes.COMPOSITE);
             viewport.resetProperties();
             viewport.resetCamera();
@@ -668,7 +737,7 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
                         {" - "}
                         {seriesData.modality || "Unknown modality"}
                         {" - "}
-                        {isVolume ? "Multi-planar view" : "Stack view"}
+                        {isVolume ? "Multi-planar and 3D view" : "Stack view"}
                     </p>
                 </div>
                 {onClose && (
@@ -754,10 +823,19 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
                 ref={gridRef}
                 style={{
                     ...gridStyle,
-                    gridTemplateColumns:
-                        visibleLayout === "all"
-                            ? `repeat(${viewports.length}, minmax(0, 1fr))`
-                            : "minmax(0, 1fr)",
+                    // The three planes and the 3D view sit two by two
+                    ...(visibleLayout === "all" && isVolume
+                        ? {
+                              gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                              gridTemplateRows: "repeat(2, minmax(0, 1fr))",
+                              height: "800px",
+                          }
+                        : {
+                              gridTemplateColumns:
+                                  visibleLayout === "all"
+                                      ? `repeat(${viewports.length}, minmax(0, 1fr))`
+                                      : "minmax(0, 1fr)",
+                          }),
                 }}
             >
                 {viewports.map((vp) => {
@@ -808,29 +886,60 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
                                 <div
                                     style={{ ...overlayStyle, top: 6, right: 8 }}
                                 >
-                                    {slabLabel(slab)}
+                                    {vp.is3D
+                                        ? presets3D.find((p) => p.id === preset3D)
+                                              ?.label
+                                        : slabLabel(slab)}
                                 </div>
-                                <div
-                                    style={{
-                                        ...overlayStyle,
-                                        bottom: 6,
-                                        left: 8,
-                                    }}
-                                >
-                                    {count > 0 &&
-                                        `Slice ${(info.index ?? 0) + 1} / ${count}`}
-                                </div>
-                                <div
-                                    style={{
-                                        ...overlayStyle,
-                                        bottom: 6,
-                                        right: 8,
-                                    }}
-                                >
-                                    {info.windowWidth !== undefined &&
-                                        `W ${Math.round(info.windowWidth)} / L ${Math.round(info.windowCenter)}`}
-                                </div>
+                                {!vp.is3D && (
+                                    <>
+                                        <div
+                                            style={{
+                                                ...overlayStyle,
+                                                bottom: 6,
+                                                left: 8,
+                                            }}
+                                        >
+                                            {count > 0 &&
+                                                `Slice ${(info.index ?? 0) + 1} / ${count}`}
+                                        </div>
+                                        <div
+                                            style={{
+                                                ...overlayStyle,
+                                                bottom: 6,
+                                                right: 8,
+                                            }}
+                                        >
+                                            {info.windowWidth !== undefined &&
+                                                `W ${Math.round(info.windowWidth)} / L ${Math.round(info.windowCenter)}`}
+                                        </div>
+                                    </>
+                                )}
                             </div>
+                            {vp.is3D ? (
+                                <div style={sliderRowStyle}>
+                                    <span style={view3DHintStyle}>
+                                        Drag to turn · middle drag pan · right
+                                        drag zoom
+                                    </span>
+                                    <button
+                                        onClick={() =>
+                                            setOpenSettings((prev) => ({
+                                                ...prev,
+                                                [vp.id]: !prev[vp.id],
+                                            }))
+                                        }
+                                        style={
+                                            settingsOpen
+                                                ? smallActiveBtnStyle
+                                                : smallBtnStyle
+                                        }
+                                        aria-expanded={settingsOpen}
+                                    >
+                                        Settings
+                                    </button>
+                                </div>
+                            ) : (
                             <div style={sliderRowStyle}>
                                 <button
                                     onClick={() =>
@@ -884,7 +993,16 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
                                     Settings
                                 </button>
                             </div>
-                            {settingsOpen && (
+                            )}
+                            {settingsOpen && vp.is3D && (
+                                <Volume3DSettings
+                                    label={vp.label}
+                                    presets={presets3D}
+                                    preset={preset3D}
+                                    onPresetChange={setChosenPreset3D}
+                                />
+                            )}
+                            {settingsOpen && !vp.is3D && (
                                 <ViewportSettings
                                     label={vp.label}
                                     isVolume={isVolume}
@@ -916,7 +1034,7 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
                 Left drag: selected tool · Wheel: scroll slices · Middle drag:
                 pan · Right drag: zoom
                 {isVolume &&
-                    " · Double-click a view to enlarge it · Drag a reference line to move that plane, or an end handle to rotate that plane on its own · A plane with a slab shows its thickness as two outer lines, which can be dragged by their handles"}
+                    " · In the 3D view, left drag turns the volume · Double-click a view to enlarge it · Drag a reference line to move that plane, or an end handle to rotate that plane on its own · A plane with a slab shows its thickness as two outer lines, which can be dragged by their handles"}
             </p>
 
             <div style={infoStyle}>
@@ -1120,6 +1238,16 @@ const sliderRowStyle = {
     gap: "0.4rem",
     padding: "0.3rem 0.5rem",
     background: "#181825",
+};
+
+const view3DHintStyle = {
+    flex: 1,
+    minWidth: 0,
+    fontSize: "0.8em",
+    color: "#a6adc8",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
 };
 
 const progressOverlayStyle = {

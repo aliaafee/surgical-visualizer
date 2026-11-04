@@ -10,6 +10,8 @@ import {
     StackScrollTool,
     PlanarRotateTool,
     CrosshairsTool,
+    TrackballRotateTool,
+    ToolGroupManager,
 } from "@cornerstonejs/tools";
 import { pb } from "@/lib/pb";
 
@@ -53,6 +55,66 @@ export function applyToolBindings(toolGroup, primaryToolName) {
     });
 }
 
+// ─── 3D volume rendering ─────────────────────────────────────────────────────
+
+// Transfer functions offered for a 3D view (names of Cornerstone's built-in
+// viewport presets), with the one each modality starts on
+export const VOLUME_3D_PRESETS = {
+    CT: [
+        { id: "CT-Bone", label: "Bone" },
+        { id: "CT-Bones", label: "Bones (high contrast)" },
+        { id: "CT-Soft-Tissue", label: "Soft tissue" },
+        { id: "CT-Muscle", label: "Muscle" },
+        { id: "CT-Lung", label: "Lung" },
+        { id: "CT-Chest-Contrast-Enhanced", label: "Chest, contrast" },
+        { id: "CT-Chest-Vessels", label: "Chest vessels" },
+        { id: "CT-Cardiac", label: "Cardiac" },
+        { id: "CT-Coronary-Arteries", label: "Coronary arteries" },
+        { id: "CT-AAA", label: "Aorta (AAA)" },
+        { id: "CT-Liver-Vasculature", label: "Liver vasculature" },
+        { id: "CT-MIP", label: "MIP" },
+    ],
+    MR: [
+        { id: "MR-Default", label: "Default" },
+        { id: "MR-Angio", label: "Angio" },
+        { id: "MR-T2-Brain", label: "T2 brain" },
+        { id: "MR-MIP", label: "MIP" },
+    ],
+};
+
+// Presets for a series' modality; anything that isn't CT gets the MR ones,
+// whose ramps suit unscaled intensities
+export function volume3DPresetsFor(modality) {
+    return modality === "CT" ? VOLUME_3D_PRESETS.CT : VOLUME_3D_PRESETS.MR;
+}
+
+const VOLUME_3D_TOOLS = [TrackballRotateTool, PanTool, ZoomTool];
+
+// A tool group for 3D views: left drag turns the volume, middle drag pans,
+// right drag zooms. The slice tools make no sense on a rendered volume.
+export function createVolume3DToolGroup(toolGroupId) {
+    const toolGroup = ToolGroupManager.createToolGroup(toolGroupId);
+    VOLUME_3D_TOOLS.forEach(({ toolName }) => toolGroup.addTool(toolName));
+    toolGroup.setToolActive(TrackballRotateTool.toolName, {
+        bindings: [{ mouseButton: MouseBindings.Primary }],
+    });
+    toolGroup.setToolActive(PanTool.toolName, {
+        bindings: [{ mouseButton: MouseBindings.Auxiliary }],
+    });
+    toolGroup.setToolActive(ZoomTool.toolName, {
+        bindings: [{ mouseButton: MouseBindings.Secondary }],
+    });
+    return toolGroup;
+}
+
+// Shows `volumeId` volume-rendered in a 3D viewport with the given preset
+export async function showVolume3D(viewport, volumeId, preset) {
+    await viewport.setVolumes([{ volumeId }]);
+    viewport.setProperties({ preset });
+    viewport.resetCamera();
+    viewport.render();
+}
+
 // Parallel slice downloads while building a volume
 const LOAD_CONCURRENCY = 6;
 
@@ -73,10 +135,10 @@ export async function loadImages(imageIds, onProgress, isCancelled) {
     await Promise.all(Array.from({ length: LOAD_CONCURRENCY }, worker));
 }
 
-// Volume (MPR) viewports need WebGL; without it Cornerstone falls back to CPU
-// rendering, which only draws stacks
+// Volume (MPR and 3D) viewports need WebGL; without it Cornerstone falls back
+// to CPU rendering, which only draws stacks
 export const MPR_UNAVAILABLE_MESSAGE =
-    "MPR needs WebGL, which this browser has not made available. " +
+    "MPR and 3D need WebGL, which this browser has not made available. " +
     "Turn on hardware acceleration in the browser settings and reload, " +
     "or view the series as a stack.";
 
@@ -105,6 +167,8 @@ export function initializeCornerstone() {
             VIEWER_TOOLS.forEach((tool) => addTool(tool));
             // Only used by the multi-planar view, which adds it per tool group
             addTool(CrosshairsTool);
+            // Only used by 3D views, which have a tool group of their own
+            addTool(TrackballRotateTool);
 
             console.log("Cornerstone initialized successfully");
         })().catch((err) => {
