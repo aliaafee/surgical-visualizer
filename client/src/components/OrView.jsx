@@ -45,8 +45,14 @@ import {
 } from "@/lib/volume3d";
 import { fetchPatients, patientLabel } from "@/lib/patients";
 import PatientPicker from "./PatientPicker";
+import { readOrSession, writeOrSession } from "@/lib/or-session";
+import SliceRangePicker from "./SliceRangePicker";
+import {
+    selectSlices,
+    sliceRangeKey,
+    sliceRangeLabel,
+} from "@/lib/slice-range";
 
-const STORAGE_KEY = "or-view-layout";
 const MAX_GRID = 4;
 // PocketBase cancels an in-flight request when an identical one is sent, but
 // several cells can legitimately ask for the same thing at once
@@ -130,16 +136,15 @@ const HANDLE_OFFSET = 0.3;
 
 let orViewInstanceCount = 0;
 
-// Each patient's OR layout is remembered separately
-function storageKeyFor(patientId) {
-    return `${STORAGE_KEY}:${patientId}`;
+// An empty grid, for a first visit or a fresh start
+function blankLayout() {
+    return { rows: 1, cols: 2, cells: [null, null] };
 }
 
+// Each patient's last OR layout, remembered separately
 function loadLayout(patientId) {
     try {
-        const saved = JSON.parse(
-            localStorage.getItem(storageKeyFor(patientId)),
-        );
+        const saved = readOrSession(patientId);
         const rows = Math.min(MAX_GRID, Math.max(1, saved.rows | 0));
         const cols = Math.min(MAX_GRID, Math.max(1, saved.cols | 0));
         const cells = Array.from(
@@ -154,7 +159,7 @@ function loadLayout(patientId) {
         });
         return { rows, cols, cells };
     } catch {
-        return { rows: 1, cols: 2, cells: [null, null] };
+        return blankLayout();
     }
 }
 
@@ -323,14 +328,22 @@ function lineCentreOn(centre, camera) {
     );
 }
 
-// The OR view works on one patient at a time, so it starts by asking which
-export default function OrView({ patientId, onChoosePatient, onClose }) {
+// The OR view works on one patient at a time, so it starts by asking which.
+// It restores the patient's last session, unless `fresh` asks for an empty
+// grid (which replaces that session only once something is changed).
+export default function OrView({
+    patientId,
+    fresh = false,
+    onChoosePatient,
+    onClose,
+}) {
     if (!patientId) {
         return <OrPatientChooser onChoose={onChoosePatient} onClose={onClose} />;
     }
     return (
         <OrPatientView
             patientId={patientId}
+            fresh={fresh}
             onChangePatient={() => onChoosePatient(null)}
             onClose={onClose}
         />
@@ -390,10 +403,14 @@ function OrPatientChooser({ onChoose, onClose }) {
     );
 }
 
-function OrPatientView({ patientId, onChangePatient, onClose }) {
+function OrPatientView({ patientId, fresh, onChangePatient, onClose }) {
     const [initialized, setInitialized] = useState(false);
     const [error, setError] = useState("");
-    const [layout, setLayout] = useState(() => loadLayout(patientId));
+    const [layout, setLayout] = useState(() =>
+        fresh ? blankLayout() : loadLayout(patientId),
+    );
+    // A fresh start leaves the last session saved until the grid is changed
+    const untouchedLayoutRef = useRef(fresh ? layout : null);
     const [engine, setEngine] = useState(null);
     const [patient, setPatient] = useState(null);
     const [studies, setStudies] = useState(null);
@@ -527,14 +544,9 @@ function OrPatientView({ patientId, onChangePatient, onClose }) {
 
     // Remember the grid between visits
     useEffect(() => {
-        try {
-            localStorage.setItem(
-                storageKeyFor(patientId),
-                JSON.stringify(layout),
-            );
-        } catch {
-            // Storage unavailable: the layout just won't be remembered
-        }
+        if (layout === untouchedLayoutRef.current) return;
+        untouchedLayoutRef.current = null;
+        writeOrSession(patientId, layout);
     }, [layout, patientId]);
 
     const loadStudySeries = useCallback(
@@ -585,13 +597,15 @@ function OrPatientView({ patientId, onChangePatient, onClose }) {
         return promises.get(seriesId);
     }, []);
 
-    // The volume for a series, built once and shared by all its MPR cells
-    const getVolume = useCallback((seriesId, imageIds, onProgress) => {
+    // The volume for a series (or the part of it given by `rangeKey`),
+    // built once and shared by all the MPR cells showing that part
+    const getVolume = useCallback((seriesId, rangeKey, imageIds, onProgress) => {
         const promises = volumePromisesRef.current;
-        if (!promises.has(seriesId)) {
+        const key = `${seriesId}:${rangeKey}`;
+        if (!promises.has(key)) {
             const promise = (async () => {
                 await loadImages(imageIds, onProgress, () => false);
-                const volumeId = `cornerstoneStreamingImageVolume:or-${seriesId}`;
+                const volumeId = `cornerstoneStreamingImageVolume:or-${key}`;
                 const volume = await volumeLoader.createAndCacheVolume(
                     volumeId,
                     { imageIds },
@@ -599,12 +613,12 @@ function OrPatientView({ patientId, onChangePatient, onClose }) {
                 volume.load();
                 return volumeId;
             })().catch((err) => {
-                promises.delete(seriesId);
+                promises.delete(key);
                 throw err;
             });
-            promises.set(seriesId, promise);
+            promises.set(key, promise);
         }
-        return promises.get(seriesId);
+        return promises.get(key);
     }, []);
 
     const handleCellReady = useCallback((index, info) => {
@@ -1236,6 +1250,9 @@ function OrViewCell({
 
     const seriesId = content?.seriesId;
     const view = content?.view;
+    // The part of the series a volume is built from (null: all of it), as
+    // a stable value for the effect below
+    const rangeJson = JSON.stringify(content?.range ?? null);
 
     // Show the chosen series in this cell's viewport
     useEffect(() => {
@@ -1316,13 +1333,16 @@ function OrViewCell({
             if (!series.imageIds.length) throw new Error("Series has no images");
 
             if (isVolume) {
+                const range = JSON.parse(rangeJson);
+                const imageIds = selectSlices(series.imageIds, range);
                 const volumeId = await getVolume(
                     seriesId,
-                    series.imageIds,
+                    sliceRangeKey(range, series.imageIds.length),
+                    imageIds,
                     (loaded) => {
                         if (!isCancelled) {
                             setStatus(
-                                `Loading slices ${loaded} / ${series.imageIds.length}`,
+                                `Loading slices ${loaded} / ${imageIds.length}`,
                             );
                         }
                     },
@@ -1415,7 +1435,7 @@ function OrViewCell({
                 ToolGroupManager.destroyToolGroup(toolGroup3DId);
             }
         };
-    }, [engine, index, seriesId, view, getSeries, getVolume, onReady]);
+    }, [engine, index, seriesId, view, rangeJson, getSeries, getVolume, onReady]);
 
     // A 3D cell's settings, kept with the cell in the layout: its rendering
     // preset (else the first for the series' modality), opacity shift,
@@ -1500,7 +1520,9 @@ function OrViewCell({
               ],
               [details.protocolName],
               [
-                  `${details.instances.length} images`,
+                  (isVolume &&
+                      sliceRangeLabel(content?.range, details.instances.length)) ||
+                      `${details.instances.length} images`,
                   details.sliceThickness &&
                       `${Number(Number(details.sliceThickness).toFixed(3))} mm thick`,
               ],
@@ -1831,6 +1853,7 @@ function CellPicker({
     const [studyId, setStudyId] = useState(content?.studyId || "");
     const [seriesId, setSeriesId] = useState(content?.seriesId || "");
     const [view, setView] = useState(content?.view || "stack");
+    const [range, setRange] = useState(content?.range ?? null);
 
     useEffect(() => {
         if (studyId) loadStudySeries(studyId);
@@ -1876,7 +1899,10 @@ function CellPicker({
 
             <select
                 value={seriesId}
-                onChange={(e) => setSeriesId(e.target.value)}
+                onChange={(e) => {
+                    setSeriesId(e.target.value);
+                    setRange(null);
+                }}
                 disabled={!seriesList}
                 style={pickerSelectStyle}
                 aria-label={`Cell ${index + 1} series`}
@@ -1909,6 +1935,19 @@ function CellPicker({
                 ))}
             </select>
 
+            {/* A volume can be built from part of the series */}
+            {series && chosenView !== "stack" && (
+                <div style={{ width: "100%", maxWidth: 420 }}>
+                <SliceRangePicker
+                    key={seriesId}
+                    total={series.instanceCount || 0}
+                    value={range}
+                    onChange={setRange}
+                    idPrefix={`cell-${index}`}
+                />
+                </div>
+            )}
+
             <div style={{ display: "flex", gap: 8 }}>
                 <button
                     onClick={() =>
@@ -1916,6 +1955,7 @@ function CellPicker({
                             studyId,
                             seriesId,
                             view: chosenView,
+                            range: chosenView !== "stack" ? range : null,
                             label:
                                 series.seriesDescription ||
                                 `Series ${series.seriesNumber}`,
@@ -2142,7 +2182,9 @@ const pickerStyle = {
     display: "flex",
     flexDirection: "column",
     alignItems: "center",
-    justifyContent: "center",
+    // Scrolls rather than clipping the top in a small cell
+    justifyContent: "safe center",
+    overflowY: "auto",
     gap: "0.5rem",
     padding: "0.75rem",
     background: "rgba(17, 17, 27, 0.95)",

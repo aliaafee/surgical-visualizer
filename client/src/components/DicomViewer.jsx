@@ -23,6 +23,12 @@ import {
 } from "@cornerstonejs/tools";
 import { pb } from "@/lib/pb";
 import ViewportSettings, { Volume3DSettings } from "./ViewportSettings";
+import SliceRangePicker from "./SliceRangePicker";
+import {
+    selectSlices,
+    sliceRangeKey,
+    sliceRangeLabel,
+} from "@/lib/slice-range";
 import {
     PROJECTIONS,
     DEFAULT_SLAB,
@@ -183,6 +189,12 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
     const [settings3D, setSettings3D] = useState(DEFAULT_SETTINGS_3D);
     // Whether the volume is showing in the 3D view yet
     const [ready3D, setReady3D] = useState(false);
+    // The part of the series built into the volume (null: all of it), and
+    // whether it is being chosen, which holds back loading the volume
+    const [sliceRange, setSliceRange] = useState(null);
+    const [draftRange, setDraftRange] = useState(null);
+    const [choosingRange, setChoosingRange] = useState(true);
+    const [rangeLoaded, setRangeLoaded] = useState(false);
 
     const gridRef = useRef(null);
     const elementRefs = useRef({});
@@ -195,6 +207,8 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
     const isVolume =
         mode === "mpr" && Boolean(seriesData?.is3DCapable) && !forceStack;
     const viewports = isVolume ? VOLUME_VIEWPORTS : STACK_VIEWPORTS;
+    const awaitingRange = isVolume && choosingRange;
+    const totalSlices = seriesData?.instances?.length || 0;
     // Window presets are in Hounsfield units, so greyscale CT only
     const isCT =
         seriesData?.modality === "CT" &&
@@ -245,6 +259,10 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
             setNotice("");
             setForceStack(false);
             setLayout("all");
+            setSliceRange(null);
+            setDraftRange(null);
+            setChoosingRange(true);
+            setRangeLoaded(false);
 
             try {
                 const data = await pb.send(
@@ -287,6 +305,8 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
     // Setup viewports, tools and load the images
     useEffect(() => {
         if (!initialized || !seriesData?.instances?.length) return;
+        // A volume waits for the slices it is built from to be chosen
+        if (awaitingRange) return;
 
         const activeViewports = isVolume ? VOLUME_VIEWPORTS : STACK_VIEWPORTS;
         const elements = activeViewports.map(
@@ -310,9 +330,13 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
             (vp) => elementRefs.current[vp.id],
         );
         const viewportIds = planeViewports.map((vp) => vp.id);
-        const imageIds = seriesData.instances.map((instance) =>
+        const allImageIds = seriesData.instances.map((instance) =>
             instanceImageId(instance.id),
         );
+        // A volume can be built from part of the series
+        const imageIds = isVolume
+            ? selectSlices(allImageIds, sliceRange)
+            : allImageIds;
 
         setViewportInfo({});
         setSlabSettings({});
@@ -465,7 +489,7 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
             );
             if (isCancelled) return;
 
-            const volumeId = `cornerstoneStreamingImageVolume:${seriesData.id}`;
+            const volumeId = `cornerstoneStreamingImageVolume:${seriesData.id}:${sliceRangeKey(sliceRange, allImageIds.length)}`;
             const volume = await volumeLoader.createAndCacheVolume(volumeId, {
                 imageIds,
             });
@@ -569,7 +593,14 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
             cache.purgeCache();
             wadouri.dataSetCacheManager.purge();
         };
-    }, [initialized, seriesData, isVolume, updateViewportInfo]);
+    }, [
+        initialized,
+        seriesData,
+        isVolume,
+        awaitingRange,
+        sliceRange,
+        updateViewportInfo,
+    ]);
 
     useEffect(() => {
         slabSettingsRef.current = slabSettings;
@@ -807,9 +838,9 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
 
     const currentInstance = useMemo(() => {
         const instances = seriesData?.instances || [];
-        if (isVolume) return instances[0];
+        if (isVolume) return selectSlices(instances, sliceRange)[0];
         return instances[viewportInfo.stack?.index ?? 0] || instances[0];
-    }, [seriesData, isVolume, viewportInfo]);
+    }, [seriesData, isVolume, sliceRange, viewportInfo]);
 
     if (loading) {
         return (
@@ -858,6 +889,9 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
                         {seriesData.modality || "Unknown modality"}
                         {" - "}
                         {isVolume ? "Multi-planar and 3D view" : "Stack view"}
+                        {isVolume &&
+                            sliceRange &&
+                            ` - ${sliceRangeLabel(sliceRange, totalSlices)}`}
                     </p>
                 </div>
                 {onClose && (
@@ -869,6 +903,42 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
 
             {notice && <p style={noticeStyle}>{notice}</p>}
 
+            {awaitingRange ? (
+                <div style={rangeChoiceStyle}>
+                    <SliceRangePicker
+                        key={seriesData.id}
+                        total={totalSlices}
+                        value={draftRange}
+                        onChange={setDraftRange}
+                        idPrefix="viewer"
+                    />
+                    <div style={{ display: "flex", gap: 8 }}>
+                        <button
+                            onClick={() => {
+                                setSliceRange(draftRange);
+                                setChoosingRange(false);
+                                setRangeLoaded(true);
+                            }}
+                            style={activeBtnStyle}
+                        >
+                            Load
+                        </button>
+                        {/* Back to the slices loaded before */}
+                        {rangeLoaded && (
+                            <button
+                                onClick={() => {
+                                    setDraftRange(sliceRange);
+                                    setChoosingRange(false);
+                                }}
+                                style={btnStyle}
+                            >
+                                Cancel
+                            </button>
+                        )}
+                    </div>
+                </div>
+            ) : (
+            <>
             <div style={toolbarStyle}>
                 <div style={toolbarGroupStyle}>
                     {PRIMARY_TOOLS.filter(
@@ -932,6 +1002,21 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
                             />
                             Link windowing
                         </label>
+                    )}
+                    {isVolume && (
+                        <button
+                            onClick={() => {
+                                setDraftRange(sliceRange);
+                                setChoosingRange(true);
+                                // The volume is let go while choosing
+                                setVolumeReady(false);
+                                setReady3D(false);
+                            }}
+                            style={btnStyle}
+                            title="Choose which slices the volume is built from"
+                        >
+                            Slices…
+                        </button>
                     )}
                     <button onClick={resetView} style={btnStyle}>
                         Reset
@@ -1165,8 +1250,10 @@ export default function DicomViewer({ seriesId, mode = "stack", onClose }) {
                 Left drag: selected tool · Wheel: scroll slices · Middle drag:
                 pan · Right drag: zoom
                 {isVolume &&
-                    " · In the 3D view, left drag turns the volume; with reference lines on, it outlines each plane, and its Settings can crop the volume or cut it along a plane · Double-click a view to enlarge it · Drag a reference line to move that plane, or an end handle to rotate that plane on its own · A plane with a slab shows its thickness as two outer lines, which can be dragged by their handles"}
+                    " · In the 3D view, left drag turns the volume; with reference lines on, it outlines each plane, and its Settings can crop the volume or cut it along a plane · Double-click a view to enlarge it · Drag a reference line to move that plane, or an end handle to rotate that plane on its own · A plane with a slab shows its thickness as two outer lines, which can be dragged by their handles · Slices… loads a different part of the series"}
             </p>
+            </>
+            )}
 
             <div style={infoStyle}>
                 <MetadataSection
@@ -1283,6 +1370,14 @@ const headerStyle = {
     marginBottom: "1rem",
     paddingBottom: "1rem",
     borderBottom: "1px solid #45475a",
+};
+
+const rangeChoiceStyle = {
+    display: "flex",
+    flexDirection: "column",
+    gap: 10,
+    maxWidth: 480,
+    margin: "1rem 0",
 };
 
 const noticeStyle = {

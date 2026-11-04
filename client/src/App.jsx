@@ -12,7 +12,9 @@ import OrView from "./components/OrView";
 //   #/                                    patients
 //   #/patients/<id>                       a patient's studies
 //   #/patients/<id>/view/<series>/<mode>  a series in the viewer
-//   #/or, #/or/<patient id>               the OR view
+//   #/or, #/or/<patient id>               the OR view, restoring the
+//                                         patient's last session
+//   #/or/<patient id>/new                 the OR view with an empty grid
 //   #/test                                the original upload test page
 function parseHash(hash) {
     const parts = hash
@@ -32,7 +34,13 @@ function parseHash(hash) {
         }
         return { page: "patient", patientId: parts[1] };
     }
-    if (parts[0] === "or") return { page: "or", patientId: parts[1] || null };
+    if (parts[0] === "or") {
+        return {
+            page: "or",
+            patientId: parts[1] || null,
+            fresh: Boolean(parts[1]) && parts[2] === "new",
+        };
+    }
     if (parts[0] === "test") return { page: "test" };
     return { page: "patients" };
 }
@@ -59,6 +67,20 @@ function App() {
     );
 
     const route = parseHash(hash);
+    const freshOrPatient = route.page === "or" && route.fresh && route.patientId;
+
+    // Once an empty OR view is open, its address becomes the plain one, so
+    // a refresh restores what has been set up since instead of emptying it
+    // again. Replacing the address doesn't fire hashchange, so the page
+    // stays mounted.
+    useEffect(() => {
+        if (!freshOrPatient) return;
+        window.history.replaceState(
+            null,
+            "",
+            `#/or/${encodeURIComponent(freshOrPatient)}`,
+        );
+    }, [freshOrPatient]);
 
     // The test page has its own login form
     if (route.page === "test") {
@@ -77,7 +99,8 @@ function App() {
                     onViewSeries={(seriesId, mode) =>
                         go("patients", route.patientId, "view", seriesId, mode)
                     }
-                    onOpenOrView={() => go("or", route.patientId)}
+                    onOpenOrView={() => go("or", route.patientId, "new")}
+                    onResumeOrView={() => go("or", route.patientId)}
                 />
             );
         case "viewer":
@@ -93,8 +116,9 @@ function App() {
             return (
                 <OrView
                     // A different patient starts a fresh OR view
-                    key={route.patientId || ""}
+                    key={`${route.patientId || ""}${route.fresh ? ":new" : ""}`}
                     patientId={route.patientId}
+                    fresh={route.fresh}
                     onChoosePatient={(id) => (id ? go("or", id) : go("or"))}
                     onClose={() =>
                         route.patientId ? go("patients", route.patientId) : go()

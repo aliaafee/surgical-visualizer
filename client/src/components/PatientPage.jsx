@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import AppHeader from "./AppHeader";
 import UploadDialog from "./UploadDialog";
 import { pb } from "@/lib/pb";
+import { hasOrSession } from "@/lib/or-session";
 import {
     btnStyle,
     colors,
@@ -28,6 +29,7 @@ export default function PatientPage({
     onBack,
     onViewSeries,
     onOpenOrView,
+    onResumeOrView,
 }) {
     const [patient, setPatient] = useState(null);
     const [error, setError] = useState("");
@@ -135,8 +137,19 @@ export default function PatientPage({
                                     style={btnStyle}
                                     onClick={onOpenOrView}
                                     disabled={!studies.length}
+                                    title="Start the OR view with an empty grid"
                                 >
                                     Open OR view
+                                </button>
+                                <button
+                                    style={btnStyle}
+                                    onClick={onResumeOrView}
+                                    disabled={
+                                        !studies.length || !hasOrSession(patientId)
+                                    }
+                                    title="Reopen the OR view as it was last left"
+                                >
+                                    Resume last OR session
                                 </button>
                                 <button
                                     style={primaryBtnStyle}
